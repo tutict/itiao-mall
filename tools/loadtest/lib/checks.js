@@ -32,3 +32,18 @@ export function expectJsonField(res, field, label) {
     },
   });
 }
+
+/**
+ * 大小写无关地读响应头。
+ *
+ * k6 的 `r.headers` 键名大小写随服务端发的是什么而定，直接写
+ * `r.headers['Access-Control-Allow-Origin']` 在服务端换了大小写时会静默拿到
+ * undefined —— 断言于是恒假，看起来像"功能坏了"，其实只是取错了键。
+ */
+export function header(res, name) {
+  const want = name.toLowerCase();
+  for (const k of Object.keys(res.headers || {})) {
+    if (k.toLowerCase() === want) return res.headers[k];
+  }
+  return '';
+}

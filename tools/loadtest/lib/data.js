@@ -5,6 +5,14 @@
 
 export const BASE_URL = __ENV.BASE_URL || 'http://localhost:8080';
 
+// 每个请求都带上 Origin，模拟真实浏览器。
+//
+// 为什么必须带：服务端的 CORS 中间件在 `Origin == ""` 时直接放行（原生 App、curl
+// 走的就是这条路），**不会**执行设 CORS 响应头那段代码。压测不带 Origin 的话，
+// 新加的中间件等于没被压到 —— 门禁绿了也不代表它没引入回归。
+// dev 环境放行任意 localhost 端口，所以这里填什么端口都行。
+export const CORS_ORIGIN = __ENV.CORS_ORIGIN || 'http://localhost:5173';
+
 // 普通 SKU：种子把库存设成 1000000，专门用来测吞吐，不会出现"卖光了"。
 export const NORMAL_SKUS = [
   'bbbbbbbb-0000-4000-8000-000000000001',

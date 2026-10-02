@@ -148,6 +148,10 @@ func isPublicRoute(method, path, paymentProvider string) bool {
 	// 预检请求按规范不带 Authorization 头，对它做认证没有意义。
 	// 正常情况下 CORS 中间件已经在它之前短路掉了；这里再放行一次是纵深防御 ——
 	// 万一将来有人调整中间件顺序，也不会退化成"所有跨域请求 401"。
+	//
+	// 注意：正因为有这一条，"中间件顺序被改错"单靠这一层是掩盖得住的（authGate 会放行
+	// OPTIONS，CORS 仍能补上头）。真正把它钉死的是 smoke.js 里的预检断言 ——
+	// 实测同时改掉顺序和这一条，预检才会退回 401。
 	case method == http.MethodOptions:
 		return true
 	case path == "/healthz", path == "/readyz":

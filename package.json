@@ -16,7 +16,11 @@
     "infra:up": "docker compose -f deploy/docker-compose.dev.yml up -d",
     "infra:down": "docker compose -f deploy/docker-compose.dev.yml down",
     "api:dev": "bash scripts/api.sh",
-    "perf": "bash scripts/perf.sh"
+    "perf": "bash scripts/perf.sh",
+    "perf:verify": "bash scripts/verify-perf-gate.sh",
+    "perf:test": "node --test tools/loadtest/scripts/compare.test.mjs",
+    "acceptance": "node scripts/acceptance-app.mjs",
+    "preview:web": "node scripts/preview-web.mjs --port 8081"
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.15",

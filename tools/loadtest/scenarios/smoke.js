@@ -4,8 +4,8 @@
 // 跑 load 之前先过 smoke —— 否则一个字段改了名，load 会花 4 分钟告诉你同样的事。
 import { check, sleep } from 'k6';
 import { authHeaders, http, jsonHeaders, login } from '../lib/auth.js';
-import { expectOk, expectOrderOutcome, expectStatus } from '../lib/checks.js';
-import { BASE_URL, NORMAL_SKUS, PRODUCT_IDS } from '../lib/data.js';
+import { expectOk, expectOrderOutcome, expectStatus, header } from '../lib/checks.js';
+import { BASE_URL, CORS_ORIGIN, NORMAL_SKUS, PRODUCT_IDS } from '../lib/data.js';
 
 export const options = {
   vus: 1,
@@ -26,6 +26,32 @@ export default function () {
     tags: { name: 'list_products' },
   });
   expectOk(list, 'list_products');
+
+  // 1b) CORS：跨域响应必须带上正确的头。
+  //     把这条钉在冒烟里，是因为中间件顺序一旦被改回 authGate 在前，
+  //     curl 逐个测接口**看不出来**（预检本来就不带 Authorization），只有浏览器会炸。
+  check(list, {
+    'cors: 回显 Origin（不是通配符）': (r) =>
+      header(r, 'Access-Control-Allow-Origin') === CORS_ORIGIN,
+    'cors: 带 Vary: Origin': (r) => header(r, 'Vary').includes('Origin'),
+  });
+
+  // 1c) 预检：这条才是当初真的坏掉的那个。
+  //     OPTIONS 不带 Authorization，如果 authGate 排在 CORS 前面就会拿到 401。
+  const preflight = http.options(`${BASE_URL}/api/v1/orders`, {
+    headers: {
+      Origin: CORS_ORIGIN,
+      'Access-Control-Request-Method': 'POST',
+      'Access-Control-Request-Headers': 'authorization,content-type',
+    },
+    tags: { name: 'cors_preflight' },
+  });
+  check(preflight, {
+    'cors_preflight: 204': (r) => r.status === 204,
+    'cors_preflight: 回显 Origin': (r) => header(r, 'Access-Control-Allow-Origin') === CORS_ORIGIN,
+    'cors_preflight: Allow-Headers 含 Authorization': (r) =>
+      header(r, 'Access-Control-Allow-Headers').toLowerCase().includes('authorization'),
+  });
 
   // 2) 商品详情
   const detail = http.get(`${BASE_URL}/api/v1/products/${PRODUCT_IDS[0]}`, {
