@@ -142,6 +142,9 @@ func runServe(cfg *config.Config, logger *slog.Logger) error {
 		Wechat:       wechat,
 		Payment:      payProvider,
 		PendingTTL:   cfg.OrderPendingTTL,
+
+		CORSOrigins:    cfg.CORSOrigins(),
+		CORSAllowLocal: cfg.CORSAllowLocalhost(),
 	})
 
 	srv := &http.Server{

@@ -31,12 +31,17 @@ type Deps struct {
 	Wechat       auth.WechatExchanger
 	Payment      payment.Provider
 	PendingTTL   time.Duration
+
+	// CORS 需要放在 authGate 之前执行，原因见 cors.go 的注释。
+	CORSOrigins    []string
+	CORSAllowLocal bool
 }
 
 // NewRouter 组装路由与中间件链。
 //
 // 中间件顺序有讲究：RequestID 必须最先（后面所有日志都要用它），
-// Recoverer 要在业务之前的最后一层（这样它下面任何 panic 都能兜住）。
+// Recoverer 要在业务之前的最后一层（这样它下面任何 panic 都能兜住），
+// CORS 必须在 authGate 之前（预检请求不带 Authorization，见 cors.go）。
 func NewRouter(d Deps) http.Handler {
 	r := chi.NewRouter()
 
@@ -45,6 +50,7 @@ func NewRouter(d Deps) http.Handler {
 	r.Use(Recoverer)
 	r.Use(chimw.RealIP)
 	r.Use(chimw.Timeout(30 * time.Second))
+	r.Use(CORS(CORSConfig{AllowedOrigins: d.CORSOrigins, AllowLocalhost: d.CORSAllowLocal}))
 	r.Use(authGate(d.Issuer, d.Payment.Name()))
 
 	// /readyz 不在契约里：它是编排层面的探针，不该因为 API 契约变动而抖动。
@@ -139,6 +145,11 @@ func authGate(issuer *auth.TokenIssuer, paymentProvider string) func(http.Handle
 // 新增接口时如果没在这里登记，它会被自动保护起来。
 func isPublicRoute(method, path, paymentProvider string) bool {
 	switch {
+	// 预检请求按规范不带 Authorization 头，对它做认证没有意义。
+	// 正常情况下 CORS 中间件已经在它之前短路掉了；这里再放行一次是纵深防御 ——
+	// 万一将来有人调整中间件顺序，也不会退化成"所有跨域请求 401"。
+	case method == http.MethodOptions:
+		return true
 	case path == "/healthz", path == "/readyz":
 		return true
 	case strings.HasPrefix(path, "/api/v1/auth/"):

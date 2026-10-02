@@ -8,6 +8,8 @@ node_modules/
 dist/
 build/
 out/
+# Expo web 静态导出（`expo export --platform web`）的输出目录。
+apps/app/dist-web/
 
 # ---- Expo / React Native ----
 .expo/
@@ -52,3 +54,8 @@ Thumbs.db
 .vscode/*
 !.vscode/extensions.json
 !.vscode/settings.json
+
+# ---- 本地临时/记忆目录 ----
+# .workbuddy 存的是本机会话记忆与临时脚本，属于个人工作区状态，不进版本库。
+.workbuddy/
+.tmp/

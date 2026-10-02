@@ -60,6 +60,27 @@ cd apps/app && pnpm start        # 或 pnpm android / pnpm web
 Android 模拟器里 `localhost` 指向模拟器自己，宿主机要用 `10.0.2.2`。App 已按平台设好默认值，
 真机调试用 `EXPO_PUBLIC_API_BASE_URL=http://<你的局域网IP>:8080` 覆盖。
 
+## 跨域（CORS）
+
+商户 Web（P1）与 Expo web 都要从浏览器打后端，所以 CORS 是必需品，不是可选项。
+
+| 环境变量 | 默认 | 作用 |
+| --- | --- | --- |
+| `CORS_ALLOWED_ORIGINS` | 空 | 逗号分隔的**精确** origin，如 `https://shop.example.com,https://m.example.com` |
+| —（无变量） | dev 自动开 | dev 环境额外放行任意 `localhost` / `127.0.0.1` / `[::1]` 端口 |
+
+两条踩过的坑，都写进了 `internal/httpapi/cors.go` 的注释与 `cors_test.go`：
+
+1. **CORS 必须排在 `authGate` 之前。** 预检 `OPTIONS` 按规范**不带** `Authorization` 头，
+   而 `authGate` 是默认拒绝的。顺序反了，每个带 token 的跨域请求都会先吃一个 401 ——
+   这个 bug 用 curl 逐个测接口**测不出来**，只有真实浏览器会炸。所以 `isPublicRoute` 里
+   另外放行了 `OPTIONS` 作纵深防御。
+2. **`Vary: Origin` 必须无条件加**，不能只加在"放行"分支。未放行来源拿到的是同一 URL 上
+   "没有 ACAO"的另一个响应体；若被共享缓存（CDN / 反代）缓存，之后合法来源会取到那份副本，
+   浏览器照样拦。实测确认过这两条：预检 204 + 回显 origin，恶意 origin 无 ACAO 但仍带 `Vary`。
+
+响应头**刻意不设** `Access-Control-Allow-Credentials`：本项目走 Bearer token，不用 Cookie。
+
 ## 性能门禁：两层，分工不同
 
 **这是本项目最该先读的一段。**

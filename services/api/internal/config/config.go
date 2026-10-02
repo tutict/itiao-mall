@@ -35,6 +35,13 @@ type Config struct {
 
 	// 未支付订单的超时时长，超时后取消并释放库存。
 	OrderPendingTTL time.Duration `env:"ORDER_PENDING_TTL" envDefault:"15m"`
+
+	// CORSAllowedOrigins 是允许跨域的精确 origin，逗号分隔（如 http://localhost:5173,https://m.example.com）。
+	//
+	// 留空时按环境分流：dev 放行任意 localhost / 127.0.0.1 / [::1] 端口
+	// （Expo web 与 Vite 每次端口都可能不同，逐个登记不现实）；
+	// prod 留空等于**不允许任何跨域** —— 要开放必须显式配置，不替使用方猜。
+	CORSAllowedOrigins string `env:"CORS_ALLOWED_ORIGINS" envDefault:""`
 }
 
 // Load 读取并校验配置。
@@ -84,6 +91,24 @@ func (c *Config) validate() error {
 
 func (c *Config) IsProd() bool { return strings.EqualFold(c.AppEnv, "prod") }
 func (c *Config) IsDev() bool  { return !c.IsProd() }
+
+// CORSOrigins 把逗号分隔的配置拆成列表。
+func (c *Config) CORSOrigins() []string {
+	if strings.TrimSpace(c.CORSAllowedOrigins) == "" {
+		return nil
+	}
+	parts := strings.Split(c.CORSAllowedOrigins, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if v := strings.TrimSpace(p); v != "" {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+// CORSAllowLocalhost 仅在非生产环境打开"放行 localhost 任意端口"的便利开关。
+func (c *Config) CORSAllowLocalhost() bool { return c.IsDev() }
 
 // SlogLevel 把字符串日志级别映射到 slog 级别。
 func (c *Config) SlogLevel() slog.Level {
