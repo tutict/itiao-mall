@@ -8,11 +8,35 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 )
 
-// 角色。用户端与商户端共用同一套签发逻辑，靠 role 区分权限。
+// 角色。用户端、商户端、管理员端共用同一套签发逻辑，靠 role 区分权限。
+//
+// 权限判定不在这里做 —— 这里只声明常量。真正的判定收敛在 httpapi 的路由策略表，
+// 因为「哪个角色能访问哪段路径」是路由层的知识，不该散落到 auth 包。
 const (
 	RoleUser     = "user"
 	RoleMerchant = "merchant"
+	// RoleAdmin 是平台运营：审核商户入驻、审核商品上架。
+	RoleAdmin = "admin"
 )
+
+// knownRoles 是签发与校验都认可的角色集合。
+//
+// 校验侧也要用它：role 不在这个集合里的 token 属于**坏 token**，在解析阶段就该拒掉。
+// 为什么必须在解析阶段拦而不是留给路由层：路由策略里有一条是「任意已登录角色放行」
+// （`/api/v1/me` 那种），那类规则本来就**不看具体角色**，一个 role 为空字符串
+// 或写了别的值的 token 会从它下面直接穿过去。把它挡在解析阶段，等于给
+// 「token 里到底有没有一个合法身份」加了一道下限。
+var knownRoles = map[string]struct{}{
+	RoleUser:     {},
+	RoleMerchant: {},
+	RoleAdmin:    {},
+}
+
+// IsKnownRole 判断角色是否为已定义的角色之一。
+func IsKnownRole(role string) bool {
+	_, ok := knownRoles[role]
+	return ok
+}
 
 const (
 	typAccess  = "access"
@@ -91,6 +115,9 @@ func (t *TokenIssuer) ParseAccess(raw string) (*Claims, error) {
 	if claims.UserID == "" {
 		return nil, fmt.Errorf("%w: 缺少 uid", ErrInvalidToken)
 	}
+	if !IsKnownRole(claims.Role) {
+		return nil, fmt.Errorf("%w: 未知角色 %q", ErrInvalidToken, claims.Role)
+	}
 	return claims, nil
 }
 
@@ -109,6 +136,3 @@ func FromContext(ctx context.Context) (*Claims, bool) {
 	c, ok := ctx.Value(ctxKeyClaims).(*Claims)
 	return c, ok && c != nil
 }
-
-// RequireRole 判断 claims 是否具备指定角色。
-func (c *Claims) HasRole(role string) bool { return c.Role == role }

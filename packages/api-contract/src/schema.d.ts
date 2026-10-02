@@ -59,6 +59,31 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/auth/admin/login": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 管理员端登录（手机号 + 密码）
+         * @description 平台运营账号登录。
+         *
+         *     与商户端登录**分开**，是为了让「谁能从哪个入口进来」成为结构性事实、
+         *     而不是口头约定：`merchant/login` 拒绝非 merchant 角色，本入口拒绝非 admin 角色。
+         *     如果共用一个入口，商户端就能拿到 admin 的令牌 —— 前端拿到的身份与它以为的
+         *     对不上，而这类错配在客户端极难发现，通常要等到越权事故发生才暴露。
+         */
+        post: operations["loginAdmin"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/auth/refresh": {
         parameters: {
             query?: never;
@@ -302,7 +327,7 @@ export interface components {
             nickname?: string;
             avatar_url?: string;
         };
-        MerchantLoginRequest: {
+        PasswordLoginRequest: {
             phone: string;
             /** Format: password */
             password: string;
@@ -512,7 +537,32 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["MerchantLoginRequest"];
+                "application/json": components["schemas"]["PasswordLoginRequest"];
+            };
+        };
+        responses: {
+            /** @description 登录成功 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AuthSession"];
+                };
+            };
+            default: components["responses"]["Problem"];
+        };
+    };
+    loginAdmin: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PasswordLoginRequest"];
             };
         };
         responses: {

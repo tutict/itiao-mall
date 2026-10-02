@@ -180,14 +180,15 @@ func TestCORSPreflightPassesAuthGateButRealRequestStillFails(t *testing.T) {
 }
 
 // 纵深防御：即使将来有人调整了中间件顺序，OPTIONS 也不该被认证拦下。
-func TestIsPublicRoute_OptionsAlwaysPublic(t *testing.T) {
+func TestPolicyFor_OptionsAlwaysPublic(t *testing.T) {
+	table := routePolicy("mock")
 	for _, path := range []string{"/api/v1/me", "/api/v1/orders", "/api/v1/cart", "/api/v1/anything/new"} {
-		if !isPublicRoute(http.MethodOptions, path, "mock") {
-			t.Fatalf("OPTIONS %s 应被放行（预检不带凭证）", path)
+		if lv := policyFor(table, http.MethodOptions, path).level; lv != levelPublic {
+			t.Fatalf("OPTIONS %s 应被放行（预检不带凭证），实际 level=%d", path, lv)
 		}
 	}
 	// 反向确认：同一个路径的 GET 仍然受保护，别把门开太大。
-	if isPublicRoute(http.MethodGet, "/api/v1/me", "mock") {
-		t.Fatal("/api/v1/me 的 GET 不该是公开路由")
+	if lv := policyFor(table, http.MethodGet, "/api/v1/me").level; lv != levelAnyRole {
+		t.Fatalf("/api/v1/me 的 GET 应是「任意已登录」而不是公开，实际 level=%d", lv)
 	}
 }

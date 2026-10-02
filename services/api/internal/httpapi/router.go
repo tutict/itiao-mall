@@ -111,17 +111,32 @@ func readyz(d Deps) http.HandlerFunc {
 	}
 }
 
-// authGate 是**默认拒绝**的认证门禁。
+// authGate 是**默认拒绝**的认证与鉴权门禁。
 //
-// 两个设计决定：
+// 三个设计决定：
 //  1. 不用 chi 的 RoutePattern 做精确匹配 —— chi 的 r.Use 中间件在路由匹配之前执行，
 //     那时 RoutePattern 还是空的。所以按路径前缀判定。
-//  2. 默认拒绝而非默认放行：新增接口如果忘了登记白名单，它会被保护起来（fail closed），
+//  2. 默认拒绝而非默认放行：新增接口如果忘了登记策略，它会被保护起来（fail closed），
 //     而不是对外裸奔。写漏一个接口最多是 401，不会变成数据泄露。
+//  3. 认证与鉴权合在同一层：先解 token，再查策略表判角色。拆成两层也能做，但那样
+//     「哪段路径要认证」和「哪段路径要什么角色」这两份知识会散在两个地方 ——
+//     而它们本来就是同一个问题（这条路径谁能进）。
+//
+// 策略表的内容与每一条的设计理由见 access.go。
 func authGate(issuer *auth.TokenIssuer, paymentProvider string) func(http.Handler) http.Handler {
+	table := routePolicy(paymentProvider)
+
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if isPublicRoute(r.Method, r.URL.Path, paymentProvider) {
+			pol := policyFor(table, r.Method, r.URL.Path)
+
+			switch pol.level {
+			case levelDeny:
+				// 未登记的路由一律拒绝。这里回 401 而不是 404 —— 路径是否存在归 chi 管，
+				// 认证层不该替它回答「这个路径有没有东西」，那等于白送一个接口探测入口。
+				WriteProblem(w, r, domain.ErrUnauthorized)
+				return
+			case levelPublic:
 				next.ServeHTTP(w, r)
 				return
 			}
@@ -136,54 +151,15 @@ func authGate(issuer *auth.TokenIssuer, paymentProvider string) func(http.Handle
 				WriteProblem(w, r, err)
 				return
 			}
-			next.ServeHTTP(w, r.WithContext(auth.WithClaims(r.Context(), claims)))
-		})
-	}
-}
 
-// isPublicRoute 判定某条路由是否无需登录。
-// 新增接口时如果没在这里登记，它会被自动保护起来。
-func isPublicRoute(method, path, paymentProvider string) bool {
-	switch {
-	// 预检请求按规范不带 Authorization 头，对它做认证没有意义。
-	// 正常情况下 CORS 中间件已经在它之前短路掉了；这里再放行一次是纵深防御 ——
-	// 万一将来有人调整中间件顺序，也不会退化成"所有跨域请求 401"。
-	//
-	// 注意：正因为有这一条，"中间件顺序被改错"单靠这一层是掩盖得住的（authGate 会放行
-	// OPTIONS，CORS 仍能补上头）。真正把它钉死的是 smoke.js 里的预检断言 ——
-	// 实测同时改掉顺序和这一条，预检才会退回 401。
-	case method == http.MethodOptions:
-		return true
-	case path == "/healthz", path == "/readyz":
-		return true
-	case strings.HasPrefix(path, "/api/v1/auth/"):
-		return true
-	// 商品浏览对未登录用户开放
-	case method == http.MethodGet && (path == "/api/v1/products" || strings.HasPrefix(path, "/api/v1/products/")):
-		return true
-	// mock 支付回调入口只在 mock 模式下存在；换真实支付后这里直接当作 404，
-	// 不能留一个可以凭空把订单改成已支付的公开入口。
-	case method == http.MethodPost && path == "/api/v1/pay/mock/notify":
-		return paymentProvider == "mock"
-	default:
-		return false
-	}
-}
-
-// RequireRole 在 authGate 之后使用，做角色鉴权（商户端接口用）。
-func RequireRole(role string) func(http.Handler) http.Handler {
-	return func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			claims, ok := auth.FromContext(r.Context())
-			if !ok {
-				WriteProblem(w, r, domain.ErrUnauthorized)
-				return
-			}
-			if !claims.HasRole(role) {
+			if pol.level == levelRoles && !pol.allowsRole(claims.Role) {
+				// 回 403 而不是 404：调用方已经通过认证、知道自己是哪个角色，
+				// 「你没这个权限」不透露任何它本来不知道的信息。
 				WriteProblem(w, r, domain.ErrForbidden)
 				return
 			}
-			next.ServeHTTP(w, r)
+
+			next.ServeHTTP(w, r.WithContext(auth.WithClaims(r.Context(), claims)))
 		})
 	}
 }

@@ -65,6 +65,19 @@ func (h *Handler) LoginMerchant(ctx context.Context, req gen.LoginMerchantReques
 	return gen.LoginMerchant200JSONResponse(toGenSession(sess)), nil
 }
 
+// LoginAdmin 管理员端登录。与 LoginMerchant 是同一套实现的两个入口，
+// 差别只在各自要求的角色（见 service 层 loginWithPassword）。
+func (h *Handler) LoginAdmin(ctx context.Context, req gen.LoginAdminRequestObject) (gen.LoginAdminResponseObject, error) {
+	if req.Body == nil {
+		return nil, fmt.Errorf("%w: 请求体为空", domain.ErrInvalidCredentials)
+	}
+	sess, err := h.svc.LoginAdmin(ctx, req.Body.Phone, req.Body.Password)
+	if err != nil {
+		return nil, err
+	}
+	return gen.LoginAdmin200JSONResponse(toGenSession(sess)), nil
+}
+
 func (h *Handler) RefreshToken(ctx context.Context, req gen.RefreshTokenRequestObject) (gen.RefreshTokenResponseObject, error) {
 	if req.Body == nil {
 		return nil, auth.ErrRefreshInvalid

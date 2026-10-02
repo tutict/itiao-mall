@@ -182,12 +182,6 @@ type Health struct {
 	Status string `json:"status"`
 }
 
-// MerchantLoginRequest defines model for MerchantLoginRequest.
-type MerchantLoginRequest struct {
-	Password string `json:"password"`
-	Phone    string `json:"phone"`
-}
-
 // MockNotifyRequest defines model for MockNotifyRequest.
 type MockNotifyRequest struct {
 	// AmountCents 金额，单位为「分」
@@ -244,6 +238,12 @@ type OrderPage struct {
 
 // OrderStatus 订单状态。流转规则见后端 state machine。
 type OrderStatus string
+
+// PasswordLoginRequest defines model for PasswordLoginRequest.
+type PasswordLoginRequest struct {
+	Password string `json:"password"`
+	Phone    string `json:"phone"`
+}
 
 // PrepayResult defines model for PrepayResult.
 type PrepayResult struct {
@@ -382,11 +382,14 @@ type ListProductsParams struct {
 	PageSize *int    `form:"page_size,omitempty" json:"page_size,omitempty"`
 }
 
+// LoginAdminJSONRequestBody defines body for LoginAdmin for application/json ContentType.
+type LoginAdminJSONRequestBody = PasswordLoginRequest
+
 // LogoutJSONRequestBody defines body for Logout for application/json ContentType.
 type LogoutJSONRequestBody = RefreshRequest
 
 // LoginMerchantJSONRequestBody defines body for LoginMerchant for application/json ContentType.
-type LoginMerchantJSONRequestBody = MerchantLoginRequest
+type LoginMerchantJSONRequestBody = PasswordLoginRequest
 
 // RefreshTokenJSONRequestBody defines body for RefreshToken for application/json ContentType.
 type RefreshTokenJSONRequestBody = RefreshRequest
@@ -405,6 +408,9 @@ type MockPayNotifyJSONRequestBody = MockNotifyRequest
 
 // ServerInterface represents all server handlers.
 type ServerInterface interface {
+	// LoginAdmin 管理员端登录（手机号 + 密码）
+	// (POST /api/v1/auth/admin/login)
+	LoginAdmin(w http.ResponseWriter, r *http.Request)
 	// Logout 登出
 	// (POST /api/v1/auth/logout)
 	Logout(w http.ResponseWriter, r *http.Request)
@@ -458,6 +464,12 @@ type ServerInterface interface {
 // Unimplemented server implementation that returns http.StatusNotImplemented for each endpoint.
 
 type Unimplemented struct{}
+
+// LoginAdmin 管理员端登录（手机号 + 密码）
+// (POST /api/v1/auth/admin/login)
+func (_ Unimplemented) LoginAdmin(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusNotImplemented)
+}
 
 // Logout 登出
 // (POST /api/v1/auth/logout)
@@ -563,6 +575,20 @@ type ServerInterfaceWrapper struct {
 }
 
 type MiddlewareFunc func(http.Handler) http.Handler
+
+// LoginAdmin operation middleware
+func (siw *ServerInterfaceWrapper) LoginAdmin(w http.ResponseWriter, r *http.Request) {
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.LoginAdmin(w, r)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
 
 // Logout operation middleware
 func (siw *ServerInterfaceWrapper) Logout(w http.ResponseWriter, r *http.Request) {
@@ -1101,6 +1127,9 @@ func HandlerWithOptions(si ServerInterface, options ChiServerOptions) http.Handl
 		r.Post(options.BaseURL+"/api/v1/auth/merchant/login", wrapper.LoginMerchant)
 	})
 	r.Group(func(r chi.Router) {
+		r.Post(options.BaseURL+"/api/v1/auth/admin/login", wrapper.LoginAdmin)
+	})
+	r.Group(func(r chi.Router) {
 		r.Post(options.BaseURL+"/api/v1/auth/refresh", wrapper.RefreshToken)
 	})
 	r.Group(func(r chi.Router) {
@@ -1144,6 +1173,45 @@ func HandlerWithOptions(si ServerInterface, options ChiServerOptions) http.Handl
 }
 
 type ProblemJSONResponse Problem
+
+type LoginAdminRequestObject struct {
+	Body *LoginAdminJSONRequestBody
+}
+
+type LoginAdminResponseObject interface {
+	VisitLoginAdminResponse(w http.ResponseWriter) error
+}
+
+type LoginAdmin200JSONResponse AuthSession
+
+func (response LoginAdmin200JSONResponse) VisitLoginAdminResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type LoginAdmindefaultJSONResponse struct {
+	Body       Problem
+	StatusCode int
+}
+
+func (response LoginAdmindefaultJSONResponse) VisitLoginAdminResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(response.StatusCode)
+	_, err := buf.WriteTo(w)
+	return err
+}
 
 type LogoutRequestObject struct {
 	Body *LogoutJSONRequestBody
@@ -1764,6 +1832,9 @@ func (response HealthzdefaultJSONResponse) VisitHealthzResponse(w http.ResponseW
 
 // StrictServerInterface represents all server handlers.
 type StrictServerInterface interface {
+	// LoginAdmin 管理员端登录（手机号 + 密码）
+	// (POST /api/v1/auth/admin/login)
+	LoginAdmin(ctx context.Context, request LoginAdminRequestObject) (LoginAdminResponseObject, error)
 	// Logout 登出
 	// (POST /api/v1/auth/logout)
 	Logout(ctx context.Context, request LogoutRequestObject) (LogoutResponseObject, error)
@@ -1851,6 +1922,37 @@ type strictHandler struct {
 	ssi         StrictServerInterface
 	middlewares []StrictMiddlewareFunc
 	options     StrictHTTPServerOptions
+}
+
+// LoginAdmin operation middleware
+func (sh *strictHandler) LoginAdmin(w http.ResponseWriter, r *http.Request) {
+	var request LoginAdminRequestObject
+
+	var body LoginAdminJSONRequestBody
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		sh.options.RequestErrorHandlerFunc(w, r, fmt.Errorf("can't decode JSON body: %w", err))
+		return
+	}
+	request.Body = &body
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.LoginAdmin(ctx, request.(LoginAdminRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "LoginAdmin")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(LoginAdminResponseObject); ok {
+		if err := validResponse.VisitLoginAdminResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
 }
 
 // Logout operation middleware

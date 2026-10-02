@@ -22,6 +22,45 @@ VALUES (
 ON CONFLICT (id) DO UPDATE
 SET phone = EXCLUDED.phone, password_hash = EXCLUDED.password_hash, updated_at = now();
 
+-- ---------- 平台运营账号 ----------
+-- 密码明文是 admin123（本地/压测环境专用）。
+-- 三个角色都必须有种子账号，否则「越权矩阵」这条验收在本地根本跑不起来 ——
+-- 只有 user 和 merchant 的话，admin 那一整列都是没测过的。
+INSERT INTO users (id, role, phone, password_hash, nickname)
+VALUES (
+    '88888888-0000-4000-8000-000000000001',
+    'admin',
+    '13700000000',
+    '$2a$10$VDwE1pJ2Fus.wmJnRbgxI.4wcotR2Kj8jhLLaztY5zJEEQsqCu9/6',
+    '平台运营'
+)
+ON CONFLICT (id) DO UPDATE
+SET phone = EXCLUDED.phone, password_hash = EXCLUDED.password_hash, updated_at = now();
+
+-- ---------- 商户入驻资料 ----------
+-- 必须和商户账号一起建，不能指望迁移去补。
+-- 迁移 0002 里那段"存量商户补 profile"只在**迁移执行的那一刻**扫一遍现有的商品归属；
+-- 而压测/验收每次都会 reset + seed 把 users 清空重建 —— 重建出来的商户没有 profile，
+-- 于是商户端每个业务接口都会把它判定为「未入驻」。
+-- 结果是：压测门禁每跑一次，就把商户重置回"审核中"状态。这种坑在本地表现为
+-- "昨天还好好的"，所以在这里一次说清。
+--
+-- 给 APPROVED：种子商户是已经在卖货的存量商户，不该被入驻审核流程卡住。
+INSERT INTO merchant_profiles (user_id, shop_name, contact_name, contact_phone, status, reviewed_at)
+VALUES (
+    '99999999-0000-4000-8000-000000000001',
+    '测试商户旗舰店',
+    '测试联系人',
+    '13800000000',
+    'APPROVED',
+    now()
+)
+ON CONFLICT (user_id) DO UPDATE
+SET shop_name = EXCLUDED.shop_name,
+    contact_name = EXCLUDED.contact_name,
+    status = EXCLUDED.status,
+    updated_at = now();
+
 -- ---------- 商品 ----------
 INSERT INTO products (id, merchant_id, title, description, category, cover_url, status)
 SELECT

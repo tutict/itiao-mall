@@ -50,6 +50,21 @@ func (s *Service) LoginWechat(ctx context.Context, code, nickname, avatarURL str
 
 // LoginMerchant 商户端登录：手机号 + 密码。
 func (s *Service) LoginMerchant(ctx context.Context, phone, password string) (*Session, error) {
+	return s.loginWithPassword(ctx, phone, password, auth.RoleMerchant)
+}
+
+// LoginAdmin 管理员端登录：手机号 + 密码。
+//
+// 与商户端登录**共用实现**，但角色要求各自写死。这样「手机号 + 密码」这套凭证
+// 只能从它对应的入口换到对应角色的令牌：商户入口拒收 admin 账号，管理员入口拒收
+// merchant 账号。共用一个入口的话，商户端就能拿到 admin 的令牌，而前端拿到的身份
+// 与它以为的对不上 —— 这类错配在客户端极难发现，通常要等越权事故发生才暴露。
+func (s *Service) LoginAdmin(ctx context.Context, phone, password string) (*Session, error) {
+	return s.loginWithPassword(ctx, phone, password, auth.RoleAdmin)
+}
+
+// loginWithPassword 是手机号 + 密码登录的共用实现。
+func (s *Service) loginWithPassword(ctx context.Context, phone, password, wantRole string) (*Session, error) {
 	user, err := s.Q.GetUserByPhone(ctx, phone)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -64,7 +79,9 @@ func (s *Service) LoginMerchant(ctx context.Context, phone, password string) (*S
 	if err := bcrypt.CompareHashAndPassword([]byte(*user.PasswordHash), []byte(password)); err != nil {
 		return nil, domain.ErrInvalidCredentials
 	}
-	if user.Role != auth.RoleMerchant {
+	if user.Role != wantRole {
+		// 刻意回 403 而不是 401：凭证本身是对的，只是这个入口不接待这个角色。
+		// 回 401 会让调用方以为密码错了，然后反复重试。
 		return nil, domain.ErrForbidden
 	}
 	if err := ensureActive(user); err != nil {
