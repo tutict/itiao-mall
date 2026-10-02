@@ -89,8 +89,25 @@ func (c *Config) validate() error {
 	return nil
 }
 
-func (c *Config) IsProd() bool { return strings.EqualFold(c.AppEnv, "prod") }
-func (c *Config) IsDev() bool  { return !c.IsProd() }
+// IsProd 用**白名单反查**而不是黑名单：只有明确写成 dev/local/test 的值才算非生产，
+// 其余一切（含拼错的 "production"、"PROD "、空串以外的任意值）都按生产处理。
+//
+// 黑名单写法（strings.EqualFold(AppEnv, "prod")）的问题是校验形同虚设只差一个字母：
+// APP_ENV=production 时密钥强度校验被静默跳过，dev-only 默认密钥直接上生产，
+// 而 HS256 是对称的 —— 签发与校验共用同一个 secret，泄露即等于全站 token 可伪造。
+//
+// 代价是新环境名（比如 staging）会默认走生产分支，即必须显式配 JWT_SECRET。
+// 这是我们想要的偏保守方向：多配一个变量，比上线后重签所有 token 便宜。
+func (c *Config) IsProd() bool {
+	switch strings.ToLower(strings.TrimSpace(c.AppEnv)) {
+	case "dev", "local", "test":
+		return false
+	default:
+		return true
+	}
+}
+
+func (c *Config) IsDev() bool { return !c.IsProd() }
 
 // CORSOrigins 把逗号分隔的配置拆成列表。
 func (c *Config) CORSOrigins() []string {

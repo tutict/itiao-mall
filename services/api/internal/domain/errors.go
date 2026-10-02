@@ -20,3 +20,50 @@ var (
 	ErrCartEmpty           = errors.New("购物车为空")
 	ErrPaymentNotPending   = errors.New("订单不处于待支付状态")
 )
+
+// UserFacing 是一个显式声明"这段文案可以给客户端看"的错误。
+//
+// 为什么需要它：HTTP 层的错误响应默认**不回**错误原文，只回固定标题。
+// 因为 err 链上常挂着第三方库的原文（json 解析、pgx、sqlc），实测过真实响应：
+//
+//	{"status":409,"detail":"资源冲突: can't decode JSON body: json: cannot unmarshal
+//	 number into Go struct field PasswordLoginRequest.phone of type string"}
+//
+// 这把 Go 类型名与字段名白送给了任何能发请求的人 —— 而字段名往往正是业务语义里
+// 抢不到、猜不着的部分（"哪个字段叫 merchant_profile_id"）。
+//
+// 但完全抹掉 detail 会误伤我们自己写的校验文案（"密码至少 8 位"、"驳回必须给出理由"），
+// 那些对用户是有用的。所以改成显式声明：业务层用 UserFacing 包住的文案才外泄，
+// 其余一律进日志。默认不外泄，要外泄得先想一下这句话给谁看。
+type UserFacing struct {
+	Msg string
+	Err error
+}
+
+func (e *UserFacing) Error() string {
+	if e.Err != nil {
+		return e.Msg + ": " + e.Err.Error()
+	}
+	return e.Msg
+}
+
+func (e *UserFacing) Unwrap() error { return e.Err }
+
+// UserFacingf 构造一条可外泄的校验错误。
+// 用法：return nil, domain.UserFacingf("密码至少 8 位", domain.ErrValidation)
+func UserFacingf(msg string, err error) error {
+	return &UserFacing{Msg: msg, Err: err}
+}
+
+// userFacingMsg 从错误链里取出可外泄的文案；没有就返回 ""。
+// 只认我们自己构造的 UserFacing —— 第三方库的错误即使文案"看起来像人话"也不放行。
+func userFacingMsg(err error) string {
+	var uf *UserFacing
+	if errors.As(err, &uf) {
+		return uf.Msg
+	}
+	return ""
+}
+
+// ExposeUserFacing 供 httpapi 层调用：返回可安全外泄的文案，没有则空串。
+func ExposeUserFacing(err error) string { return userFacingMsg(err) }

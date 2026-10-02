@@ -23,8 +23,41 @@ set -euo pipefail
 
 export PATH="/c/Users/tutic/.workbuddy/binaries/PortableGit/versions/1.2.0/usr/bin:/c/Users/tutic/.workbuddy/binaries/PortableGit/versions/1.2.0/bin:$PATH"
 
-# 本机 `python` 不一定在 PATH 上，用托管版的全路径更稳。
-PY="${PYTHON_BIN:-C:/Users/tutic/.workbuddy/binaries/python/versions/3.13.12/python.exe}"
+# 解析一个可用的 Python 解释器。
+#
+# 之前这里是硬编码的绝对路径（C:/Users/tutic/.../python.exe）。那在本机能跑，
+# 换台机器就必然失败 —— 而且报错出现在脚本中段，配上 `set -e` 就是一句
+# "line N: No such file or directory"，与"性能门禁失效"完全混得起来。
+# 人只会以为门禁坏了，不会想到是解释器找不到。
+#
+# 现在的顺序：本机托管版（保持本机行为不变）→ PYTHON_BIN 覆盖 → PATH 上的
+# python3 / python → 明确报错并说明怎么修。
+resolve_python() {
+  if [ -n "${PYTHON_BIN:-}" ]; then
+    echo "$PYTHON_BIN"
+    return 0
+  fi
+  local managed="C:/Users/tutic/.workbuddy/binaries/python/versions/3.13.12/python.exe"
+  if [ -x "$managed" ]; then
+    echo "$managed"
+    return 0
+  fi
+  local candidate
+  for candidate in python3 python; do
+    if command -v "$candidate" >/dev/null 2>&1; then
+      command -v "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+if ! PY="$(resolve_python)"; then
+  echo "找不到 Python 解释器。" >&2
+  echo "  本机默认用托管版；若在别的机器上跑，请设 PYTHON_BIN 指向解释器：" >&2
+  echo "    PYTHON_BIN=/usr/bin/python3 bash scripts/verify-perf-gate.sh" >&2
+  exit 2
+fi
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"

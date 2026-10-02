@@ -1,8 +1,9 @@
 # itiao-mall
 
-一个商城小应用的最小闭环：**用户端 App（Expo / React Native）+ 商户端 Web（Vite）+ Go 后端 + k6 性能门禁**。
+一个商城小应用的最小闭环：**用户端 App + Web（Expo / React Native）、商户端 App + Web、管理员端 App + Web、Go 后端 + k6 性能门禁**。
 
-当前阶段：P0 —— 打通「登录 → 浏览 → 加购 → 下单 → 支付回调 → 订单已支付」这条链路，并且让**性能回归有可执行的门禁**。
+当前阶段：打地基。三角色（user / merchant / admin）的权限模型、商户入驻与平台审核已落地；
+商户端与管理员端的**代码尚未开工**（`apps/merchant`、`apps/admin` 目前是空目录）。
 支付与微信登录都跑在 mock 网关上（还没有微信支付商户号与开放平台资质）；契约、防超卖、幂等、性能门禁这些都是真的。
 
 ## 技术选型
@@ -10,7 +11,7 @@
 | 层 | 选型 | 为什么 |
 | --- | --- | --- |
 | 用户端 | Expo SDK 57 + Expo Router | 一套代码出 Android / iOS。Metro 用 Babel 剥类型，**不依赖 tsc 的编程式 API**，所以能跟上 TS 7 |
-| 商户端 | Vite + React | P1，尚未开工 |
+| 商户端 | 同上（独立 Expo 代码库） | P1，尚未开工 |
 | 后端 | Go 1.25 + chi v5 | chi 与 oapi-codegen 的 chi-server 生成器零摩擦（gin/echo 得包一层自定义 Context） |
 | 契约 | OpenAPI 3.0.3 | **前后端唯一真源**。3.0（不是 3.1）是为了 oapi-codegen 的兼容性 |
 | 代码生成 | oapi-codegen → Go 严格接口；openapi-typescript → TS 类型 | 生成物提交进仓库，用 `git diff --exit-code` 卡漂移 |
@@ -36,10 +37,30 @@ services/api/             Go 后端
   internal/httpapi/       契约生成接口的实现 + 统一错误映射
 docs/openapi/openapi.yaml  契约真源
 deploy/                   docker-compose（dev / perf）
-scripts/                  入口脚本（gen / api / perf / verify-perf-gate）
+scripts/                  入口脚本，详见下方「脚本清单」
 tools/codegen/            TS 类型生成包装脚本
 tools/loadtest/           k6 场景、种子数据、基线、比对脚本
 ```
+
+### 脚本清单
+
+| 脚本 | 作用 | 必跑 |
+| --- | --- | --- |
+| `check-all.sh` | **总入口**：一次跑完下面所有守门项 | ✅ 先跑这个 |
+| `dev.sh` | 起 PG + Redis 并等健康（比手敲 `docker compose` 多一步健康等待） | |
+| `gen.sh` | 由契约生成 Go 接口与 TS 类型 | |
+| `api.sh` | 起后端（默认 `:8080`，providers=mock） | |
+| `perf.sh` | k6 压测 + 与基线比对（会 reset 并 seed 数据库） | |
+| `verify-perf-gate.sh` | 变异验证：证明性能门禁真的能拦住回归 | |
+| `verify-guards.py` | 变异验证：证明权限/审核/错误泄露/分页守卫真的有牙 | |
+| `verify-onboarding-flow.py` | 对活服务器跑一遍商户入驻全生命周期（35 步状态码断言） | |
+| `acceptance-app.mjs` | 用户端端到端验收（真实 Chromium 驱动，15 项） | |
+| `preview-web.mjs` | Expo web 产物的静态预览服务器（验收脚本的前置） | |
+
+`check-all.sh` 会断言 Go 测试的**条数下限**。这不是形式主义：不设 `DATABASE_URL` 时
+集成测试整体 skip，退出码依然是 0 —— 实测 27 PASS / 12 SKIP 与 39 PASS / 0 SKIP
+的退出码完全相同，而丢掉的 12 条恰好是超卖、幂等、回调幂等、审核 CAS。
+`MIN_GO_TESTS` 环境变量可覆盖下限。
 
 ## 快速开始
 
@@ -107,7 +128,7 @@ App 在 `:8081`、API 在 `:8080`，浏览器里的每个请求都是跨域的�
 | 层 | 在哪 | 判据 | 作用 |
 | --- | --- | --- | --- |
 | 灾难线 | `tools/loadtest/scenarios/*.js` 的 `thresholds` | 绝对值 SLO（如浏览 p95 < 300ms）、错误率上限、`checks` 通过率 | 没有基线也能跑。抓"服务已经不可用" |
-| 回归线 | `tools/loadtest/baselines/load.json` + `scripts/compare.mjs` | 同机基线中位数比对：p95 +20%、p99 +25%、吞吐 −10%、错误率绝对 0.5%，**且延迟类必须同时超过绝对下限** | **真正抓"后端引入的性能问题"** |
+| 回归线 | `tools/loadtest/baselines/load.json` + `tools/loadtest/scripts/compare.mjs` | 同机基线中位数比对：p95 +20%、p99 +25%、吞吐 −10%、错误率绝对 0.5%，**且延迟类必须同时超过绝对下限** | **真正抓"后端引入的性能问题"** |
 
 三个关键设计：
 

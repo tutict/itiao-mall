@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"strings"
 	"time"
 
@@ -103,6 +104,20 @@ func newOrderNo(now time.Time) string {
 }
 
 // normalizePage 把分页参数收进合法区间，避免 page=0 或 page_size=100000 把库打穿。
+//
+// 第二道防线（第一道是 httpapi 层的 derefInt32，拦 int64→int32 截断）。
+// 任何调用方绕过 oapi-codegen 就只剩这一道，所以它必须自己能兜住。
+//
+// 溢出是这里唯一真正危险的地方：契约里 page 只有 minimum 没有 maximum，客户端可以
+// 传任意 int32，于是 (page-1)*pageSize 会溢出：
+//
+//	(2147483647-1) * 100 = -200   ← int32 溢出成负数
+//
+// 负 OFFSET 送到 PostgreSQL 会让整条查询报错（不是返回空集），也就是一个 500。
+// 而客户端那边看到的是"翻到很后面时接口开始报错了"——极难定位。
+//
+// 所以先除后乘并做上界判断：翻到第 21,474,837 页（offset 接近 int32 上界）就直接
+// 夹到最后一页。这么深的分页本来就没人翻，夹住不损失任何真实场景。
 func normalizePage(page, pageSize int32) (limit, offset int32) {
 	if page < 1 {
 		page = 1
@@ -112,6 +127,12 @@ func normalizePage(page, pageSize int32) (limit, offset int32) {
 		pageSize = 20
 	case pageSize > 100:
 		pageSize = 100
+	}
+	// 先除后乘：page-1 的上限是 (math.MaxInt32-1)/pageSize，乘回去就不可能溢出。
+	// 这样算出的 maxPage 本身就是可表示的最大页码，不需要再单独判溢出。
+	maxPage := math.MaxInt32/pageSize + 1
+	if page > maxPage {
+		page = maxPage
 	}
 	return pageSize, (page - 1) * pageSize
 }

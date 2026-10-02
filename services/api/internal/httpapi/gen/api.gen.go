@@ -115,9 +115,11 @@ func (e PrepayResultProvider) Valid() bool {
 
 // Defines values for ProductDetailStatus.
 const (
-	ProductDetailStatusDRAFT   ProductDetailStatus = "DRAFT"
-	ProductDetailStatusOFFSALE ProductDetailStatus = "OFF_SALE"
-	ProductDetailStatusONSALE  ProductDetailStatus = "ON_SALE"
+	ProductDetailStatusDRAFT         ProductDetailStatus = "DRAFT"
+	ProductDetailStatusOFFSALE       ProductDetailStatus = "OFF_SALE"
+	ProductDetailStatusONSALE        ProductDetailStatus = "ON_SALE"
+	ProductDetailStatusPENDINGREVIEW ProductDetailStatus = "PENDING_REVIEW"
+	ProductDetailStatusREJECTED      ProductDetailStatus = "REJECTED"
 )
 
 // Valid indicates whether the value is a known member of the ProductDetailStatus enum.
@@ -129,6 +131,10 @@ func (e ProductDetailStatus) Valid() bool {
 		return true
 	case ProductDetailStatusONSALE:
 		return true
+	case ProductDetailStatusPENDINGREVIEW:
+		return true
+	case ProductDetailStatusREJECTED:
+		return true
 	default:
 		return false
 	}
@@ -136,9 +142,11 @@ func (e ProductDetailStatus) Valid() bool {
 
 // Defines values for ProductSummaryStatus.
 const (
-	ProductSummaryStatusDRAFT   ProductSummaryStatus = "DRAFT"
-	ProductSummaryStatusOFFSALE ProductSummaryStatus = "OFF_SALE"
-	ProductSummaryStatusONSALE  ProductSummaryStatus = "ON_SALE"
+	ProductSummaryStatusDRAFT         ProductSummaryStatus = "DRAFT"
+	ProductSummaryStatusOFFSALE       ProductSummaryStatus = "OFF_SALE"
+	ProductSummaryStatusONSALE        ProductSummaryStatus = "ON_SALE"
+	ProductSummaryStatusPENDINGREVIEW ProductSummaryStatus = "PENDING_REVIEW"
+	ProductSummaryStatusREJECTED      ProductSummaryStatus = "REJECTED"
 )
 
 // Valid indicates whether the value is a known member of the ProductSummaryStatus enum.
@@ -149,6 +157,10 @@ func (e ProductSummaryStatus) Valid() bool {
 	case ProductSummaryStatusOFFSALE:
 		return true
 	case ProductSummaryStatusONSALE:
+		return true
+	case ProductSummaryStatusPENDINGREVIEW:
+		return true
+	case ProductSummaryStatusREJECTED:
 		return true
 	default:
 		return false

@@ -81,8 +81,13 @@ func NewRouter(d Deps) http.Handler {
 			WriteProblem(w, r, err)
 		},
 		// 请求体解析失败属于客户端问题，回 400 而不是 500。
+		//
+		// 刻意**不**把 err 拼进去：解析库的原文含 Go 类型名与字段名
+		// （"json: cannot unmarshal number into Go struct field
+		// PasswordLoginRequest.phone of type string"），回给客户端等于送 schema。
+		// WriteProblem 只外泄 domain.UserFacingf 显式声明过的文案，这里不声明即回标题。
 		RequestErrorHandlerFunc: func(w http.ResponseWriter, r *http.Request, err error) {
-			WriteProblem(w, r, fmt.Errorf("%w: %v", domain.ErrConflict, err))
+			WriteProblem(w, r, domain.ErrValidation)
 		},
 	})
 
@@ -219,15 +224,19 @@ func merchantStatusGate(table []access, lookup merchantStatusLookup) func(http.H
 			if err != nil {
 				if errors.Is(err, domain.ErrNotFound) {
 					// 从未提交入驻资料。对外与"审核未通过"同形 —— 都是"你现在不能经营"。
-					WriteProblem(w, r, fmt.Errorf("%w: 尚未提交入驻资料", domain.ErrMerchantNotApproved))
+					WriteProblem(w, r, domain.UserFacingf(
+						"尚未提交入驻资料", domain.ErrMerchantNotApproved))
 					return
 				}
 				WriteProblem(w, r, err)
 				return
 			}
 			if status != service.MerchantApproved {
-				WriteProblem(w, r, fmt.Errorf("%w: 当前入驻状态为 %s",
-					domain.ErrMerchantNotApproved, status))
+				// 状态值必须用 UserFacing 显式声明才能外泄：WriteProblem 默认只回固定标题。
+				// 这个值是前端路由的依据（跳"审核中"还是"已驳回"），必须给出去。
+				WriteProblem(w, r, domain.UserFacingf(
+					fmt.Sprintf("当前入驻状态为 %s", status),
+					domain.ErrMerchantNotApproved))
 				return
 			}
 			next.ServeHTTP(w, r)

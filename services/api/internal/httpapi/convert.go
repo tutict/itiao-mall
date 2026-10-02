@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"math"
 	"time"
 
 	"github.com/google/uuid"
@@ -31,11 +32,24 @@ func derefStr(p *string) string {
 	return *p
 }
 
+// derefInt32 把契约的 *int 收窄成 int32。
+//
+// 收窄必须显式判范围：契约里 page 只有 minimum 没有 maximum（业务上页码没有
+// 上限），而 int64 → int32 的无条件转换在 page=2147483648 时会截断成 -2147483648，
+// 随后被 normalizePage 悄悄改写成 1 —— 客户端请求第 2147483648 页，拿到的是第 1 页，
+// 而且**没有任何报错**。这种静默错页比报错更难查。
+//
+// 越界时回落到默认值（等价于"参数没填"），与 normalizePage 对非法值的既有处理
+// 保持一致：分页参数从来不是强约束，越界不该让整个请求失败。
 func derefInt32(p *int, def int32) int32 {
 	if p == nil {
 		return def
 	}
-	return int32(*p)
+	// 用 int64 中转做比较，避免在 int32 边界上比较溢出。
+	if n := int64(*p); n >= math.MinInt32 && n <= math.MaxInt32 {
+		return int32(n)
+	}
+	return def
 }
 
 func derefInt64(p *int64) int64 {

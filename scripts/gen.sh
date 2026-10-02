@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # 契约生成：从 docs/openapi/openapi.yaml 这一份真源，同时生成 Go 服务端接口与 TS 类型。
 #
-# 生成物全部提交进仓库，CI 用 `git diff --exit-code` 卡漂移 —— 手改生成物会被立刻发现。
+# 生成物全部提交进仓库，`scripts/check-all.sh` 用 `git diff --exit-code` 卡漂移 ——
+# 手改生成物会被立刻发现。（仓库目前没有 CI，检查入口是 check-all.sh。）
 set -euo pipefail
 
 # 本机 Bash 的 PATH 是断的，先补 PortableGit

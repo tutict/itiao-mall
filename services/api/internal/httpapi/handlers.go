@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
 
@@ -401,7 +402,10 @@ func (h *Handler) MockPayNotify(ctx context.Context, req gen.MockPayNotifyReques
 		"amount_cents": derefInt64(req.Body.AmountCents),
 	})
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", payment.ErrInvalidNotify, err)
+		// 原文只进日志：不拼进返回的 error，否则 json.Marshal 的错误会带着
+		// 内部类型信息一路走到 WriteProblem（那里只外泄显式声明过的文案）。
+		slog.Error("构造支付回调报文失败", slog.Any("err", err))
+		return nil, fmt.Errorf("%w: 构造回调报文失败", payment.ErrInvalidNotify)
 	}
 
 	res, err := h.svc.HandleNotify(ctx, body, http.Header{})

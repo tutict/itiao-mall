@@ -517,7 +517,7 @@ export interface components {
             /** @description 展示价（取最低 SKU 价） */
             price_cents: components["schemas"]["Money"];
             /** @enum {string} */
-            status: "DRAFT" | "ON_SALE" | "OFF_SALE";
+            status: "DRAFT" | "PENDING_REVIEW" | "ON_SALE" | "OFF_SALE" | "REJECTED";
         };
         Sku: {
             /** Format: uuid */

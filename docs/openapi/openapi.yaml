@@ -849,7 +849,10 @@ components:
           description: 展示价（取最低 SKU 价）
         status:
           type: string
-          enum: [DRAFT, ON_SALE, OFF_SALE]
+          # 必须与 migration 0002 的 products_status_check 完全一致。
+          # 少写一个值，客户端从本契约生成的 TS 类型就无法表达平台审核中间态 ——
+          # 而那正是商户提审后、平台裁决前商品所处的状态。
+          enum: [DRAFT, PENDING_REVIEW, ON_SALE, OFF_SALE, REJECTED]
 
     Sku:
       type: object

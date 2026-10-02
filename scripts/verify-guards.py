@@ -119,6 +119,78 @@ MUTATIONS: list[Mutation] = [
         expect_fail=["TestReviewMerchant_Validation"],
         why="没有理由的驳回让商户只能靠猜，反复盲提交反而推高审核成本",
     ),
+
+    # ---- 错误响应信息泄露（2026-10-02 四轴 review 的 P0）----
+    #
+    # 修复前实测到的真实响应：
+    #   {"status":409,"detail":"资源冲突: can't decode JSON body: json: cannot
+    #    unmarshal number into Go struct field PasswordLoginRequest.phone of type string"}
+    # 这把 Go 类型名与字段名白送给任何能发请求的人。
+    Mutation(
+        ident="M7 4xx 恢复回内部错误原文",
+        rel_path="services/api/internal/httpapi/response.go",
+        old="\tdetail := domain.ExposeUserFacing(err)",
+        new="\tdetail := err.Error()",
+        expect_fail=["TestWriteProblem_NoInternalLeak"],
+        why="回到修复前的样子：解析库原文连同 Go 类型名与字段名一起外泄",
+    ),
+    Mutation(
+        ident="M8 把 4xx 的 detail 一律抹光（防『全抹』式假修复）",
+        rel_path="services/api/internal/httpapi/response.go",
+        old="\tdetail := domain.ExposeUserFacing(err)",
+        new='\tdetail := ""',
+        expect_fail=["TestWriteProblem_UserFacingStillVisible"],
+        why="抹光也能让泄露测试变绿，但前端会失去所有字段级提示 —— 这是回归不是修复",
+        note="没有这一条，M7 那种修法会被『全部抹掉 detail』轻松顶替，"
+        "而守卫看起来是绿的",
+    ),
+    Mutation(
+        ident="M9 UserFacing 只认最外层错误",
+        rel_path="services/api/internal/domain/errors.go",
+        old="\tvar uf *UserFacing\n\tif errors.As(err, &uf) {",
+        new="\tuf, ok := err.(*UserFacing)\n\tif ok && errors.As(uf, &uf) {",
+        expect_fail=["TestWriteProblem_UserFacingSurvivesWrapping"],
+        why="业务层习惯再包一层，一包就静默丢掉全部提示，且没有任何报错",
+    ),
+    Mutation(
+        ident="M10 解析失败把库错误伪装成业务文案外泄",
+        rel_path="services/api/internal/httpapi/router.go",
+        old="\t\t\tWriteProblem(w, r, domain.ErrValidation)",
+        new='\t\t\tWriteProblem(w, r, domain.UserFacingf(err.Error(), domain.ErrValidation))',
+        expect_fail=["TestRequestErrorHandler_NoDecodeLeak"],
+        why="这是最可能的真实复发形态：不明目张胆拼 %v，而是包成 UserFacing 骗过白名单",
+        note="守卫必须能识破『伪装』，否则 UserFacing 机制会变成新的泄露通道",
+    ),
+    Mutation(
+        ident="M11 入驻状态不再外泄",
+        rel_path="services/api/internal/httpapi/router.go",
+        old='\t\t\t\tWriteProblem(w, r, domain.UserFacingf(\n\t\t\t\t\tfmt.Sprintf("当前入驻状态为 %s", status),\n\t\t\t\t\tdomain.ErrMerchantNotApproved))',
+        new="\t\t\t\t_ = fmt.Sprintf\n\t\t\t\tWriteProblem(w, r, domain.ErrMerchantNotApproved)",
+        expect_fail=["TestMerchantStatusGate_ReportsCurrentStatus"],
+        why="前端要靠这个状态值决定跳「审核中」还是「已驳回」，丢了就只能一直停在错误页",
+        note="变异体带 `_ = fmt.Sprintf` 兜住导入 —— 变异后编译不过的话，"
+        "证明的是「文件坏了」而不是「守卫有牙」",
+    ),
+
+    # ---- 分页溢出 ----
+    Mutation(
+        ident="M12 derefInt32 去掉 int32 收窄判断",
+        rel_path="services/api/internal/httpapi/convert.go",
+        old="\tif n := int64(*p); n >= math.MinInt32 && n <= math.MaxInt32 {\n\t\treturn int32(n)\n\t}\n\treturn def",
+        new="\t_ = math.MaxInt32\n\treturn int32(*p)",
+        expect_fail=["TestDerefInt32_RejectsOverflow"],
+        why="page=2147483648 截断成负数后被夹回 1，客户端请求第 2147483648 页拿到第 1 页，"
+        "而且没有任何报错",
+    ),
+    Mutation(
+        ident="M13 normalizePage 去掉溢出夹取",
+        rel_path="services/api/internal/service/service.go",
+        old="\tmaxPage := math.MaxInt32/pageSize + 1\n\tif page > maxPage {\n\t\tpage = maxPage\n\t}",
+        new="\tmaxPage := math.MaxInt32/pageSize + 1\n\tif false && page > maxPage {\n\t\tpage = maxPage\n\t}",
+        expect_fail=["TestNormalizePage_ClampsToValidRange", "TestNormalizePage_OffsetNeverExceedsInt32"],
+        why="(2147483647-1)*100 溢出成 -200，负 OFFSET 送进 PostgreSQL 会让整条查询报错 —— "
+        "表现为「翻到很后面时接口开始 500」",
+    ),
 ]
 
 

@@ -7,7 +7,8 @@
 #   RECORD_BASELINE=1 RUNS=3 bash scripts/perf.sh   # 跑 3 次取中位数写入基线
 #   RESET=0 bash scripts/perf.sh         # 跳过数据重置（调试时省时间）
 #
-# 退出码即结论：0 = 未检测到回归，非 0 = 有回归或指标缺失。可直接被将来的 CI 复用。
+# 退出码即结论：0 = 未检测到回归，非 0 = 有回归或指标缺失。
+# 已由 scripts/check-all.sh 收口；将来接 CI 时可直接复用这个退出码。
 set -euo pipefail
 
 export PATH="/c/Users/tutic/.workbuddy/binaries/PortableGit/versions/1.2.0/usr/bin:/c/Users/tutic/.workbuddy/binaries/PortableGit/versions/1.2.0/bin:$PATH"

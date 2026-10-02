@@ -126,15 +126,16 @@ func (s *Service) RegisterMerchant(ctx context.Context, in MerchantRegisterInput
 
 func validateRegisterInput(in MerchantRegisterInput) error {
 	if !phoneRe.MatchString(in.Phone) {
-		return fmt.Errorf("%w: 手机号格式不正确", domain.ErrValidation)
+		return domain.UserFacingf("手机号格式不正确", domain.ErrValidation)
 	}
 	if len(in.Password) < 8 {
-		return fmt.Errorf("%w: 密码至少 8 位", domain.ErrValidation)
+		return domain.UserFacingf("密码至少 8 位", domain.ErrValidation)
 	}
 	if len(in.Password) > maxPasswordBytes {
 		// 用字节数而不是字符数：bcrypt 的 72 是字节。中文密码 24 个字就到顶了。
-		return fmt.Errorf("%w: 密码不能超过 %d 字节（bcrypt 的输入上限）",
-			domain.ErrValidation, maxPasswordBytes)
+		return domain.UserFacingf(
+			fmt.Sprintf("密码不能超过 %d 字节（bcrypt 的输入上限）", maxPasswordBytes),
+			domain.ErrValidation)
 	}
 	if err := validateProfileInput(MerchantProfileInput{
 		ShopName:     in.ShopName,
@@ -148,22 +149,22 @@ func validateRegisterInput(in MerchantRegisterInput) error {
 
 func validateProfileInput(in MerchantProfileInput) error {
 	if strings.TrimSpace(in.ShopName) == "" {
-		return fmt.Errorf("%w: 店铺名不能为空", domain.ErrValidation)
+		return domain.UserFacingf("店铺名不能为空", domain.ErrValidation)
 	}
 	if len([]rune(in.ShopName)) > 100 {
-		return fmt.Errorf("%w: 店铺名不能超过 100 字", domain.ErrValidation)
+		return domain.UserFacingf("店铺名不能超过 100 字", domain.ErrValidation)
 	}
 	if len([]rune(in.ContactName)) > 50 {
-		return fmt.Errorf("%w: 联系人不能超过 50 字", domain.ErrValidation)
+		return domain.UserFacingf("联系人不能超过 50 字", domain.ErrValidation)
 	}
 	if len(in.ContactPhone) > 32 {
-		return fmt.Errorf("%w: 联系电话过长", domain.ErrValidation)
+		return domain.UserFacingf("联系电话过长", domain.ErrValidation)
 	}
 	if len([]rune(in.Description)) > 1000 {
-		return fmt.Errorf("%w: 店铺简介不能超过 1000 字", domain.ErrValidation)
+		return domain.UserFacingf("店铺简介不能超过 1000 字", domain.ErrValidation)
 	}
 	if len(in.LogoURL) > 500 {
-		return fmt.Errorf("%w: logo 地址过长", domain.ErrValidation)
+		return domain.UserFacingf("logo 地址过长", domain.ErrValidation)
 	}
 	return nil
 }
@@ -246,7 +247,8 @@ func (s *Service) ListMerchantProfiles(
 	ctx context.Context, status string, page, pageSize int32,
 ) ([]MerchantProfileView, int64, error) {
 	if status != "" && !IsMerchantStatus(status) {
-		return nil, 0, fmt.Errorf("%w: 未知的入驻状态 %q", domain.ErrValidation, status)
+		return nil, 0, domain.UserFacingf(
+			fmt.Sprintf("未知的入驻状态 %q", status), domain.ErrValidation)
 	}
 	lim, off := normalizePage(page, pageSize)
 	statusArg := normalizeSearch(status)
@@ -278,22 +280,23 @@ func (s *Service) ReviewMerchant(
 	switch decision {
 	case MerchantApproved, MerchantRejected:
 	default:
-		return nil, fmt.Errorf("%w: 审核结论只能是 %s 或 %s",
-			domain.ErrValidation, MerchantApproved, MerchantRejected)
+		return nil, domain.UserFacingf(
+			fmt.Sprintf("审核结论只能是 %s 或 %s", MerchantApproved, MerchantRejected),
+			domain.ErrValidation)
 	}
 
 	rejectReason = strings.TrimSpace(rejectReason)
 	if decision == MerchantRejected && rejectReason == "" {
 		// 理由必填不是为了走流程：没有理由的驳回，商户只能靠猜，然后反复盲提交，
 		// 平台的审核量反而被推高。
-		return nil, fmt.Errorf("%w: 驳回必须给出理由", domain.ErrValidation)
+		return nil, domain.UserFacingf("驳回必须给出理由", domain.ErrValidation)
 	}
 	if decision == MerchantApproved {
 		// 通过时清空理由，避免上一次驳回的文案留在「已通过」的记录上误导商户。
 		rejectReason = ""
 	}
 	if len([]rune(rejectReason)) > 500 {
-		return nil, fmt.Errorf("%w: 驳回理由不能超过 500 字", domain.ErrValidation)
+		return nil, domain.UserFacingf("驳回理由不能超过 500 字", domain.ErrValidation)
 	}
 
 	if _, err := s.Q.ReviewMerchantProfile(ctx, repo.ReviewMerchantProfileParams{

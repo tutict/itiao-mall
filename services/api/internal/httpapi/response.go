@@ -8,6 +8,7 @@ import (
 
 	"github.com/tutic/itiao-mall/services/api/internal/auth"
 	"github.com/tutic/itiao-mall/services/api/internal/domain"
+	"github.com/tutic/itiao-mall/services/api/internal/payment"
 	"github.com/tutic/itiao-mall/services/api/internal/platform/logging"
 )
 
@@ -44,10 +45,30 @@ func WriteProblem(w http.ResponseWriter, r *http.Request, err error) {
 		)
 	}
 
-	detail := ""
-	if status < http.StatusInternalServerError {
-		detail = err.Error()
+	// 4xx 的 detail 也不能回 err 原文。
+	//
+	// 看着"只回 4xx 就没事"，但 err 链上常挂着第三方库的原文，而那些原文会把内部结构
+	// 反射给任何能发请求的人。实测过真实响应：
+	//
+	//	{"status":409,"detail":"资源冲突: can't decode JSON body: json: cannot unmarshal
+	//	 number into Go struct field PasswordLoginRequest.phone of type string"}
+	//
+	// 泄露了 Go 类型名与字段名 —— 攻击者据此就能画出请求体 schema，而字段名往往正是
+	// 业务语义里抢不到、猜不着的部分。
+	//
+	// 但也不能一律抹掉：我们自己写的校验文案（"密码至少 8 位"、"驳回必须给出理由"）
+	// 对用户是有用的，抹掉等于逼前端把错误提示写死。所以规则是**默认不外泄**，
+	// 业务层用 domain.UserFacingf 显式声明的那段才给。
+	detail := domain.ExposeUserFacing(err)
+
+	// 4xx 也记一笔：原文只在日志里，但排查时需要能按 path 捞到。
+	if status < http.StatusInternalServerError && detail == "" {
+		logging.From(r.Context()).Debug("请求被拒",
+			slog.String("path", r.URL.Path),
+			slog.Any("err", err),
+		)
 	}
+
 	WriteJSON(w, status, Problem{
 		Type:   "about:blank",
 		Title:  title,
@@ -74,13 +95,24 @@ func mapError(err error) (int, string) {
 		return http.StatusOK, "幂等命中"
 	case errors.Is(err, auth.ErrRefreshReused):
 		return http.StatusUnauthorized, "刷新令牌已被使用，请重新登录"
-	case errors.Is(err, auth.ErrRefreshInvalid), errors.Is(err, auth.ErrInvalidToken),
+	case errors.Is(err, auth.ErrRefreshInvalid), errors.Is(err, domain.ErrRefreshTokenInvalid),
+		errors.Is(err, auth.ErrInvalidToken),
 		errors.Is(err, domain.ErrUnauthorized), errors.Is(err, domain.ErrInvalidCredentials):
 		return http.StatusUnauthorized, "未认证或凭证无效"
+	// domain 与 auth 各有一套同义的 refresh 错误，两套都在 mapError 里显式登记。
+	// 只登记一套的话，误用另一套就会掉进 default 变成 500 —— 用户拿到"服务内部错误"
+	// 去重登，而真实原因只是令牌过期。
+	case errors.Is(err, domain.ErrRefreshTokenReused):
+		return http.StatusUnauthorized, "刷新令牌已被使用，请重新登录"
 	case errors.Is(err, domain.ErrMerchantNotApproved):
 		// 与普通 ErrForbidden 分开：客户端拿到这条应该跳「入驻进度」页，
 		// 而不是显示"无权限"把用户晾在那儿。
+		// 具体的当前状态（PENDING / REJECTED / …）由业务层用 UserFacing 带上。
 		return http.StatusForbidden, "商户入驻未通过审核"
+	case errors.Is(err, payment.ErrInvalidNotify), errors.Is(err, payment.ErrNotImplemented):
+		// 支付侧的哨兵此前没有登记，全部掉进 default 变成 500。后果是客户端拿到
+		// "服务内部错误"去重试，而真实原因只是报文格式不对 —— 重试一万次也一样。
+		return http.StatusBadRequest, "支付回调格式非法"
 	case errors.Is(err, domain.ErrForbidden):
 		return http.StatusForbidden, "无权限"
 	default:
