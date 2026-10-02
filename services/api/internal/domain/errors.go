@@ -7,10 +7,12 @@ import "errors"
 var (
 	ErrNotFound            = errors.New("资源不存在")
 	ErrConflict            = errors.New("资源冲突")
+	ErrValidation          = errors.New("参数校验失败")
 	ErrInsufficientStock   = errors.New("库存不足")
 	ErrInvalidTransition   = errors.New("订单状态流转非法")
 	ErrUnauthorized        = errors.New("未认证")
 	ErrForbidden           = errors.New("无权限")
+	ErrMerchantNotApproved = errors.New("商户入驻未通过审核")
 	ErrInvalidCredentials  = errors.New("凭证无效")
 	ErrRefreshTokenReused  = errors.New("刷新令牌已被使用（疑似重放）")
 	ErrRefreshTokenInvalid = errors.New("刷新令牌无效或已过期")

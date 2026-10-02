@@ -17,6 +17,48 @@ import (
 	openapi_types "github.com/oapi-codegen/runtime/types"
 )
 
+// Defines values for MerchantProfileStatus.
+const (
+	MerchantProfileStatusAPPROVED  MerchantProfileStatus = "APPROVED"
+	MerchantProfileStatusPENDING   MerchantProfileStatus = "PENDING"
+	MerchantProfileStatusREJECTED  MerchantProfileStatus = "REJECTED"
+	MerchantProfileStatusSUSPENDED MerchantProfileStatus = "SUSPENDED"
+)
+
+// Valid indicates whether the value is a known member of the MerchantProfileStatus enum.
+func (e MerchantProfileStatus) Valid() bool {
+	switch e {
+	case MerchantProfileStatusAPPROVED:
+		return true
+	case MerchantProfileStatusPENDING:
+		return true
+	case MerchantProfileStatusREJECTED:
+		return true
+	case MerchantProfileStatusSUSPENDED:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for MerchantReviewDecision.
+const (
+	MerchantReviewDecisionAPPROVED MerchantReviewDecision = "APPROVED"
+	MerchantReviewDecisionREJECTED MerchantReviewDecision = "REJECTED"
+)
+
+// Valid indicates whether the value is a known member of the MerchantReviewDecision enum.
+func (e MerchantReviewDecision) Valid() bool {
+	switch e {
+	case MerchantReviewDecisionAPPROVED:
+		return true
+	case MerchantReviewDecisionREJECTED:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for OrderStatus.
 const (
 	CANCELLED      OrderStatus = "CANCELLED"
@@ -115,6 +157,7 @@ func (e ProductSummaryStatus) Valid() bool {
 
 // Defines values for UserRole.
 const (
+	UserRoleAdmin    UserRole = "admin"
 	UserRoleMerchant UserRole = "merchant"
 	UserRoleUser     UserRole = "user"
 )
@@ -122,6 +165,8 @@ const (
 // Valid indicates whether the value is a known member of the UserRole enum.
 func (e UserRole) Valid() bool {
 	switch e {
+	case UserRoleAdmin:
+		return true
 	case UserRoleMerchant:
 		return true
 	case UserRoleUser:
@@ -180,6 +225,73 @@ type CreateOrderRequest struct {
 type Health struct {
 	// Status Example: ok
 	Status string `json:"status"`
+}
+
+// MerchantProfile defines model for MerchantProfile.
+type MerchantProfile struct {
+	ContactName  *string   `json:"contact_name,omitempty"`
+	ContactPhone *string   `json:"contact_phone,omitempty"`
+	CreatedAt    time.Time `json:"created_at"`
+	Description  *string   `json:"description,omitempty"`
+	LogoUrl      *string   `json:"logo_url,omitempty"`
+
+	// Phone 登录手机号。商户看自己的；管理员审核时也靠它对上号。
+	Phone *string `json:"phone,omitempty"`
+
+	// RejectReason 仅 `REJECTED` 时有值。重新提交后清空。
+	RejectReason *string    `json:"reject_reason,omitempty"`
+	ReviewedAt   *time.Time `json:"reviewed_at,omitempty"`
+	ShopName     string     `json:"shop_name"`
+
+	// Status 入驻审核状态。`SUSPENDED` 由平台在已通过之后主动停用（违规、纠纷、资料失效）。
+	Status    MerchantProfileStatus `json:"status"`
+	UpdatedAt time.Time             `json:"updated_at"`
+	UserId    openapi_types.UUID    `json:"user_id"`
+}
+
+// MerchantProfilePage defines model for MerchantProfilePage.
+type MerchantProfilePage struct {
+	Items    []MerchantProfile `json:"items"`
+	Page     int               `json:"page"`
+	PageSize int               `json:"page_size"`
+	Total    int               `json:"total"`
+}
+
+// MerchantProfileStatus 入驻审核状态。`SUSPENDED` 由平台在已通过之后主动停用（违规、纠纷、资料失效）。
+type MerchantProfileStatus string
+
+// MerchantProfileUpdateRequest defines model for MerchantProfileUpdateRequest.
+type MerchantProfileUpdateRequest struct {
+	ContactName  *string `json:"contact_name,omitempty"`
+	ContactPhone *string `json:"contact_phone,omitempty"`
+	Description  *string `json:"description,omitempty"`
+	LogoUrl      *string `json:"logo_url,omitempty"`
+	ShopName     string  `json:"shop_name"`
+}
+
+// MerchantRegisterRequest defines model for MerchantRegisterRequest.
+type MerchantRegisterRequest struct {
+	ContactName  *string `json:"contact_name,omitempty"`
+	ContactPhone *string `json:"contact_phone,omitempty"`
+
+	// Password 至少 8 位。服务端强制校验（契约里的 minLength 只用于生成文档与类型，不做运行时拦截）
+	Password string `json:"password"`
+
+	// Phone 登录手机号，全局唯一
+	Phone    string `json:"phone"`
+	ShopName string `json:"shop_name"`
+}
+
+// MerchantReviewDecision 审核结论。只能批准或驳回 —— 「挂起」不是审核动作，是事后处置。
+type MerchantReviewDecision string
+
+// MerchantReviewRequest defines model for MerchantReviewRequest.
+type MerchantReviewRequest struct {
+	// Decision 审核结论。只能批准或驳回 —— 「挂起」不是审核动作，是事后处置。
+	Decision MerchantReviewDecision `json:"decision"`
+
+	// RejectReason `decision=REJECTED` 时必填，服务端强制校验
+	RejectReason *string `json:"reject_reason,omitempty"`
 }
 
 // MockNotifyRequest defines model for MockNotifyRequest.
@@ -352,6 +464,9 @@ type WechatLoginRequest struct {
 	Nickname *string `json:"nickname,omitempty"`
 }
 
+// MerchantId defines model for MerchantId.
+type MerchantId = openapi_types.UUID
+
 // OrderId defines model for OrderId.
 type OrderId = openapi_types.UUID
 
@@ -360,6 +475,14 @@ type ProductId = openapi_types.UUID
 
 // SkuId defines model for SkuId.
 type SkuId = openapi_types.UUID
+
+// ListMerchantsParams defines parameters for ListMerchants.
+type ListMerchantsParams struct {
+	// Status 不传返回全部
+	Status   *MerchantProfileStatus `form:"status,omitempty" json:"status,omitempty"`
+	Page     *int                   `form:"page,omitempty" json:"page,omitempty"`
+	PageSize *int                   `form:"page_size,omitempty" json:"page_size,omitempty"`
+}
 
 // ListOrdersParams defines parameters for ListOrders.
 type ListOrdersParams struct {
@@ -382,6 +505,9 @@ type ListProductsParams struct {
 	PageSize *int    `form:"page_size,omitempty" json:"page_size,omitempty"`
 }
 
+// ReviewMerchantJSONRequestBody defines body for ReviewMerchant for application/json ContentType.
+type ReviewMerchantJSONRequestBody = MerchantReviewRequest
+
 // LoginAdminJSONRequestBody defines body for LoginAdmin for application/json ContentType.
 type LoginAdminJSONRequestBody = PasswordLoginRequest
 
@@ -390,6 +516,9 @@ type LogoutJSONRequestBody = RefreshRequest
 
 // LoginMerchantJSONRequestBody defines body for LoginMerchant for application/json ContentType.
 type LoginMerchantJSONRequestBody = PasswordLoginRequest
+
+// RegisterMerchantJSONRequestBody defines body for RegisterMerchant for application/json ContentType.
+type RegisterMerchantJSONRequestBody = MerchantRegisterRequest
 
 // RefreshTokenJSONRequestBody defines body for RefreshToken for application/json ContentType.
 type RefreshTokenJSONRequestBody = RefreshRequest
@@ -400,6 +529,9 @@ type LoginWechatJSONRequestBody = WechatLoginRequest
 // PutCartItemJSONRequestBody defines body for PutCartItem for application/json ContentType.
 type PutCartItemJSONRequestBody = PutCartItemRequest
 
+// UpdateMerchantProfileJSONRequestBody defines body for UpdateMerchantProfile for application/json ContentType.
+type UpdateMerchantProfileJSONRequestBody = MerchantProfileUpdateRequest
+
 // CreateOrderJSONRequestBody defines body for CreateOrder for application/json ContentType.
 type CreateOrderJSONRequestBody = CreateOrderRequest
 
@@ -408,6 +540,12 @@ type MockPayNotifyJSONRequestBody = MockNotifyRequest
 
 // ServerInterface represents all server handlers.
 type ServerInterface interface {
+	// ListMerchants 商户入驻审核队列
+	// (GET /api/v1/admin/merchants)
+	ListMerchants(w http.ResponseWriter, r *http.Request, params ListMerchantsParams)
+	// ReviewMerchant 审核商户入驻
+	// (POST /api/v1/admin/merchants/{merchantId}/review)
+	ReviewMerchant(w http.ResponseWriter, r *http.Request, merchantId MerchantId)
 	// LoginAdmin 管理员端登录（手机号 + 密码）
 	// (POST /api/v1/auth/admin/login)
 	LoginAdmin(w http.ResponseWriter, r *http.Request)
@@ -417,6 +555,9 @@ type ServerInterface interface {
 	// LoginMerchant 商户端登录（手机号 + 密码）
 	// (POST /api/v1/auth/merchant/login)
 	LoginMerchant(w http.ResponseWriter, r *http.Request)
+	// RegisterMerchant 商户自助注册（注册即待审核）
+	// (POST /api/v1/auth/merchant/register)
+	RegisterMerchant(w http.ResponseWriter, r *http.Request)
 	// RefreshToken 刷新令牌
 	// (POST /api/v1/auth/refresh)
 	RefreshToken(w http.ResponseWriter, r *http.Request)
@@ -435,6 +576,12 @@ type ServerInterface interface {
 	// GetMe 当前登录用户
 	// (GET /api/v1/me)
 	GetMe(w http.ResponseWriter, r *http.Request)
+	// GetMerchantProfile 查看自己的入驻资料与审核状态
+	// (GET /api/v1/merchant/profile)
+	GetMerchantProfile(w http.ResponseWriter, r *http.Request)
+	// UpdateMerchantProfile 更新入驻资料 / 被驳回后重新提交
+	// (PUT /api/v1/merchant/profile)
+	UpdateMerchantProfile(w http.ResponseWriter, r *http.Request)
 	// ListOrders 我的订单列表
 	// (GET /api/v1/orders)
 	ListOrders(w http.ResponseWriter, r *http.Request, params ListOrdersParams)
@@ -465,6 +612,18 @@ type ServerInterface interface {
 
 type Unimplemented struct{}
 
+// ListMerchants 商户入驻审核队列
+// (GET /api/v1/admin/merchants)
+func (_ Unimplemented) ListMerchants(w http.ResponseWriter, r *http.Request, params ListMerchantsParams) {
+	w.WriteHeader(http.StatusNotImplemented)
+}
+
+// ReviewMerchant 审核商户入驻
+// (POST /api/v1/admin/merchants/{merchantId}/review)
+func (_ Unimplemented) ReviewMerchant(w http.ResponseWriter, r *http.Request, merchantId MerchantId) {
+	w.WriteHeader(http.StatusNotImplemented)
+}
+
 // LoginAdmin 管理员端登录（手机号 + 密码）
 // (POST /api/v1/auth/admin/login)
 func (_ Unimplemented) LoginAdmin(w http.ResponseWriter, r *http.Request) {
@@ -480,6 +639,12 @@ func (_ Unimplemented) Logout(w http.ResponseWriter, r *http.Request) {
 // LoginMerchant 商户端登录（手机号 + 密码）
 // (POST /api/v1/auth/merchant/login)
 func (_ Unimplemented) LoginMerchant(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusNotImplemented)
+}
+
+// RegisterMerchant 商户自助注册（注册即待审核）
+// (POST /api/v1/auth/merchant/register)
+func (_ Unimplemented) RegisterMerchant(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNotImplemented)
 }
 
@@ -516,6 +681,18 @@ func (_ Unimplemented) PutCartItem(w http.ResponseWriter, r *http.Request, skuId
 // GetMe 当前登录用户
 // (GET /api/v1/me)
 func (_ Unimplemented) GetMe(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusNotImplemented)
+}
+
+// GetMerchantProfile 查看自己的入驻资料与审核状态
+// (GET /api/v1/merchant/profile)
+func (_ Unimplemented) GetMerchantProfile(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusNotImplemented)
+}
+
+// UpdateMerchantProfile 更新入驻资料 / 被驳回后重新提交
+// (PUT /api/v1/merchant/profile)
+func (_ Unimplemented) UpdateMerchantProfile(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNotImplemented)
 }
 
@@ -576,6 +753,91 @@ type ServerInterfaceWrapper struct {
 
 type MiddlewareFunc func(http.Handler) http.Handler
 
+// ListMerchants operation middleware
+func (siw *ServerInterfaceWrapper) ListMerchants(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// Parameter object where we will unmarshal all parameters from the context
+	var params ListMerchantsParams
+
+	// ------------- Optional query parameter "status" -------------
+
+	err = runtime.BindQueryParameterWithOptions("form", true, false, "status", r.URL.Query(), &params.Status, runtime.BindQueryParameterOptions{Type: "string", Format: ""})
+	if err != nil {
+		var requiredError *runtime.RequiredParameterError
+		if errors.As(err, &requiredError) {
+			siw.ErrorHandlerFunc(w, r, &RequiredParamError{ParamName: "status"})
+		} else {
+			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "status", Err: err})
+		}
+		return
+	}
+
+	// ------------- Optional query parameter "page" -------------
+
+	err = runtime.BindQueryParameterWithOptions("form", true, false, "page", r.URL.Query(), &params.Page, runtime.BindQueryParameterOptions{Type: "integer", Format: ""})
+	if err != nil {
+		var requiredError *runtime.RequiredParameterError
+		if errors.As(err, &requiredError) {
+			siw.ErrorHandlerFunc(w, r, &RequiredParamError{ParamName: "page"})
+		} else {
+			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "page", Err: err})
+		}
+		return
+	}
+
+	// ------------- Optional query parameter "page_size" -------------
+
+	err = runtime.BindQueryParameterWithOptions("form", true, false, "page_size", r.URL.Query(), &params.PageSize, runtime.BindQueryParameterOptions{Type: "integer", Format: ""})
+	if err != nil {
+		var requiredError *runtime.RequiredParameterError
+		if errors.As(err, &requiredError) {
+			siw.ErrorHandlerFunc(w, r, &RequiredParamError{ParamName: "page_size"})
+		} else {
+			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "page_size", Err: err})
+		}
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.ListMerchants(w, r, params)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// ReviewMerchant operation middleware
+func (siw *ServerInterfaceWrapper) ReviewMerchant(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// ------------- Path parameter "merchantId" -------------
+	var merchantId MerchantId
+
+	err = runtime.BindStyledParameterWithOptions("simple", "merchantId", chi.URLParam(r, "merchantId"), &merchantId, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "string", Format: "uuid", ValueIsUnescaped: r.URL.RawPath == ""})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "merchantId", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.ReviewMerchant(w, r, merchantId)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
 // LoginAdmin operation middleware
 func (siw *ServerInterfaceWrapper) LoginAdmin(w http.ResponseWriter, r *http.Request) {
 
@@ -609,6 +871,20 @@ func (siw *ServerInterfaceWrapper) LoginMerchant(w http.ResponseWriter, r *http.
 
 	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		siw.Handler.LoginMerchant(w, r)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// RegisterMerchant operation middleware
+func (siw *ServerInterfaceWrapper) RegisterMerchant(w http.ResponseWriter, r *http.Request) {
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.RegisterMerchant(w, r)
 	}))
 
 	for _, middleware := range siw.HandlerMiddlewares {
@@ -717,6 +993,34 @@ func (siw *ServerInterfaceWrapper) GetMe(w http.ResponseWriter, r *http.Request)
 
 	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		siw.Handler.GetMe(w, r)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// GetMerchantProfile operation middleware
+func (siw *ServerInterfaceWrapper) GetMerchantProfile(w http.ResponseWriter, r *http.Request) {
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.GetMerchantProfile(w, r)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// UpdateMerchantProfile operation middleware
+func (siw *ServerInterfaceWrapper) UpdateMerchantProfile(w http.ResponseWriter, r *http.Request) {
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.UpdateMerchantProfile(w, r)
 	}))
 
 	for _, middleware := range siw.HandlerMiddlewares {
@@ -1168,11 +1472,105 @@ func HandlerWithOptions(si ServerInterface, options ChiServerOptions) http.Handl
 	r.Group(func(r chi.Router) {
 		r.Post(options.BaseURL+"/api/v1/pay/mock/notify", wrapper.MockPayNotify)
 	})
+	r.Group(func(r chi.Router) {
+		r.Post(options.BaseURL+"/api/v1/auth/merchant/register", wrapper.RegisterMerchant)
+	})
+	r.Group(func(r chi.Router) {
+		r.Get(options.BaseURL+"/api/v1/merchant/profile", wrapper.GetMerchantProfile)
+	})
+	r.Group(func(r chi.Router) {
+		r.Put(options.BaseURL+"/api/v1/merchant/profile", wrapper.UpdateMerchantProfile)
+	})
+	r.Group(func(r chi.Router) {
+		r.Get(options.BaseURL+"/api/v1/admin/merchants", wrapper.ListMerchants)
+	})
+	r.Group(func(r chi.Router) {
+		r.Post(options.BaseURL+"/api/v1/admin/merchants/{merchantId}/review", wrapper.ReviewMerchant)
+	})
 
 	return r
 }
 
 type ProblemJSONResponse Problem
+
+type ListMerchantsRequestObject struct {
+	Params ListMerchantsParams
+}
+
+type ListMerchantsResponseObject interface {
+	VisitListMerchantsResponse(w http.ResponseWriter) error
+}
+
+type ListMerchants200JSONResponse MerchantProfilePage
+
+func (response ListMerchants200JSONResponse) VisitListMerchantsResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type ListMerchantsdefaultJSONResponse struct {
+	Body       Problem
+	StatusCode int
+}
+
+func (response ListMerchantsdefaultJSONResponse) VisitListMerchantsResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(response.StatusCode)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type ReviewMerchantRequestObject struct {
+	MerchantId MerchantId `json:"merchantId"`
+	Body       *ReviewMerchantJSONRequestBody
+}
+
+type ReviewMerchantResponseObject interface {
+	VisitReviewMerchantResponse(w http.ResponseWriter) error
+}
+
+type ReviewMerchant200JSONResponse MerchantProfile
+
+func (response ReviewMerchant200JSONResponse) VisitReviewMerchantResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type ReviewMerchantdefaultJSONResponse struct {
+	Body       Problem
+	StatusCode int
+}
+
+func (response ReviewMerchantdefaultJSONResponse) VisitReviewMerchantResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(response.StatusCode)
+	_, err := buf.WriteTo(w)
+	return err
+}
 
 type LoginAdminRequestObject struct {
 	Body *LoginAdminJSONRequestBody
@@ -1274,6 +1672,45 @@ type LoginMerchantdefaultJSONResponse struct {
 }
 
 func (response LoginMerchantdefaultJSONResponse) VisitLoginMerchantResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(response.StatusCode)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type RegisterMerchantRequestObject struct {
+	Body *RegisterMerchantJSONRequestBody
+}
+
+type RegisterMerchantResponseObject interface {
+	VisitRegisterMerchantResponse(w http.ResponseWriter) error
+}
+
+type RegisterMerchant201JSONResponse AuthSession
+
+func (response RegisterMerchant201JSONResponse) VisitRegisterMerchantResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(201)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type RegisterMerchantdefaultJSONResponse struct {
+	Body       Problem
+	StatusCode int
+}
+
+func (response RegisterMerchantdefaultJSONResponse) VisitRegisterMerchantResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
@@ -1507,6 +1944,83 @@ type GetMedefaultJSONResponse struct {
 }
 
 func (response GetMedefaultJSONResponse) VisitGetMeResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(response.StatusCode)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type GetMerchantProfileRequestObject struct {
+}
+
+type GetMerchantProfileResponseObject interface {
+	VisitGetMerchantProfileResponse(w http.ResponseWriter) error
+}
+
+type GetMerchantProfile200JSONResponse MerchantProfile
+
+func (response GetMerchantProfile200JSONResponse) VisitGetMerchantProfileResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type GetMerchantProfiledefaultJSONResponse struct {
+	Body       Problem
+	StatusCode int
+}
+
+func (response GetMerchantProfiledefaultJSONResponse) VisitGetMerchantProfileResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(response.StatusCode)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type UpdateMerchantProfileRequestObject struct {
+	Body *UpdateMerchantProfileJSONRequestBody
+}
+
+type UpdateMerchantProfileResponseObject interface {
+	VisitUpdateMerchantProfileResponse(w http.ResponseWriter) error
+}
+
+type UpdateMerchantProfile200JSONResponse MerchantProfile
+
+func (response UpdateMerchantProfile200JSONResponse) VisitUpdateMerchantProfileResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type UpdateMerchantProfiledefaultJSONResponse struct {
+	Body       Problem
+	StatusCode int
+}
+
+func (response UpdateMerchantProfiledefaultJSONResponse) VisitUpdateMerchantProfileResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
@@ -1832,6 +2346,12 @@ func (response HealthzdefaultJSONResponse) VisitHealthzResponse(w http.ResponseW
 
 // StrictServerInterface represents all server handlers.
 type StrictServerInterface interface {
+	// ListMerchants 商户入驻审核队列
+	// (GET /api/v1/admin/merchants)
+	ListMerchants(ctx context.Context, request ListMerchantsRequestObject) (ListMerchantsResponseObject, error)
+	// ReviewMerchant 审核商户入驻
+	// (POST /api/v1/admin/merchants/{merchantId}/review)
+	ReviewMerchant(ctx context.Context, request ReviewMerchantRequestObject) (ReviewMerchantResponseObject, error)
 	// LoginAdmin 管理员端登录（手机号 + 密码）
 	// (POST /api/v1/auth/admin/login)
 	LoginAdmin(ctx context.Context, request LoginAdminRequestObject) (LoginAdminResponseObject, error)
@@ -1841,6 +2361,9 @@ type StrictServerInterface interface {
 	// LoginMerchant 商户端登录（手机号 + 密码）
 	// (POST /api/v1/auth/merchant/login)
 	LoginMerchant(ctx context.Context, request LoginMerchantRequestObject) (LoginMerchantResponseObject, error)
+	// RegisterMerchant 商户自助注册（注册即待审核）
+	// (POST /api/v1/auth/merchant/register)
+	RegisterMerchant(ctx context.Context, request RegisterMerchantRequestObject) (RegisterMerchantResponseObject, error)
 	// RefreshToken 刷新令牌
 	// (POST /api/v1/auth/refresh)
 	RefreshToken(ctx context.Context, request RefreshTokenRequestObject) (RefreshTokenResponseObject, error)
@@ -1859,6 +2382,12 @@ type StrictServerInterface interface {
 	// GetMe 当前登录用户
 	// (GET /api/v1/me)
 	GetMe(ctx context.Context, request GetMeRequestObject) (GetMeResponseObject, error)
+	// GetMerchantProfile 查看自己的入驻资料与审核状态
+	// (GET /api/v1/merchant/profile)
+	GetMerchantProfile(ctx context.Context, request GetMerchantProfileRequestObject) (GetMerchantProfileResponseObject, error)
+	// UpdateMerchantProfile 更新入驻资料 / 被驳回后重新提交
+	// (PUT /api/v1/merchant/profile)
+	UpdateMerchantProfile(ctx context.Context, request UpdateMerchantProfileRequestObject) (UpdateMerchantProfileResponseObject, error)
 	// ListOrders 我的订单列表
 	// (GET /api/v1/orders)
 	ListOrders(ctx context.Context, request ListOrdersRequestObject) (ListOrdersResponseObject, error)
@@ -1922,6 +2451,65 @@ type strictHandler struct {
 	ssi         StrictServerInterface
 	middlewares []StrictMiddlewareFunc
 	options     StrictHTTPServerOptions
+}
+
+// ListMerchants operation middleware
+func (sh *strictHandler) ListMerchants(w http.ResponseWriter, r *http.Request, params ListMerchantsParams) {
+	var request ListMerchantsRequestObject
+
+	request.Params = params
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.ListMerchants(ctx, request.(ListMerchantsRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "ListMerchants")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(ListMerchantsResponseObject); ok {
+		if err := validResponse.VisitListMerchantsResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// ReviewMerchant operation middleware
+func (sh *strictHandler) ReviewMerchant(w http.ResponseWriter, r *http.Request, merchantId MerchantId) {
+	var request ReviewMerchantRequestObject
+
+	request.MerchantId = merchantId
+
+	var body ReviewMerchantJSONRequestBody
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		sh.options.RequestErrorHandlerFunc(w, r, fmt.Errorf("can't decode JSON body: %w", err))
+		return
+	}
+	request.Body = &body
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.ReviewMerchant(ctx, request.(ReviewMerchantRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "ReviewMerchant")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(ReviewMerchantResponseObject); ok {
+		if err := validResponse.VisitReviewMerchantResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
 }
 
 // LoginAdmin operation middleware
@@ -2010,6 +2598,37 @@ func (sh *strictHandler) LoginMerchant(w http.ResponseWriter, r *http.Request) {
 		sh.options.ResponseErrorHandlerFunc(w, r, err)
 	} else if validResponse, ok := response.(LoginMerchantResponseObject); ok {
 		if err := validResponse.VisitLoginMerchantResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// RegisterMerchant operation middleware
+func (sh *strictHandler) RegisterMerchant(w http.ResponseWriter, r *http.Request) {
+	var request RegisterMerchantRequestObject
+
+	var body RegisterMerchantJSONRequestBody
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		sh.options.RequestErrorHandlerFunc(w, r, fmt.Errorf("can't decode JSON body: %w", err))
+		return
+	}
+	request.Body = &body
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.RegisterMerchant(ctx, request.(RegisterMerchantRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "RegisterMerchant")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(RegisterMerchantResponseObject); ok {
+		if err := validResponse.VisitRegisterMerchantResponse(w); err != nil {
 			sh.options.ResponseErrorHandlerFunc(w, r, err)
 		}
 	} else if response != nil {
@@ -2179,6 +2798,61 @@ func (sh *strictHandler) GetMe(w http.ResponseWriter, r *http.Request) {
 		sh.options.ResponseErrorHandlerFunc(w, r, err)
 	} else if validResponse, ok := response.(GetMeResponseObject); ok {
 		if err := validResponse.VisitGetMeResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// GetMerchantProfile operation middleware
+func (sh *strictHandler) GetMerchantProfile(w http.ResponseWriter, r *http.Request) {
+	var request GetMerchantProfileRequestObject
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.GetMerchantProfile(ctx, request.(GetMerchantProfileRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "GetMerchantProfile")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(GetMerchantProfileResponseObject); ok {
+		if err := validResponse.VisitGetMerchantProfileResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// UpdateMerchantProfile operation middleware
+func (sh *strictHandler) UpdateMerchantProfile(w http.ResponseWriter, r *http.Request) {
+	var request UpdateMerchantProfileRequestObject
+
+	var body UpdateMerchantProfileJSONRequestBody
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		sh.options.RequestErrorHandlerFunc(w, r, fmt.Errorf("can't decode JSON body: %w", err))
+		return
+	}
+	request.Body = &body
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.UpdateMerchantProfile(ctx, request.(UpdateMerchantProfileRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "UpdateMerchantProfile")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(UpdateMerchantProfileResponseObject); ok {
+		if err := validResponse.VisitUpdateMerchantProfileResponse(w); err != nil {
 			sh.options.ResponseErrorHandlerFunc(w, r, err)
 		}
 	} else if response != nil {

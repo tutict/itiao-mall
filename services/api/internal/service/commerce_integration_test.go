@@ -23,9 +23,8 @@ import (
 	"github.com/tutic/itiao-mall/services/api/internal/service"
 )
 
-// newTestService 建一个接真实 PG 的 Service。Redis 客户端是惰性连接的，
-// 而本文件测的路径（下单/库存）不碰 Redis，所以不需要 Redis 实际在线。
-func newTestService(t *testing.T) (*service.Service, *pgxpool.Pool) {
+// newTestPool 打开一个连到 DATABASE_URL 的连接池；未配置则跳过用例。
+func newTestPool(t *testing.T) *pgxpool.Pool {
 	t.Helper()
 
 	dsn := os.Getenv("DATABASE_URL")
@@ -33,12 +32,20 @@ func newTestService(t *testing.T) (*service.Service, *pgxpool.Pool) {
 		t.Skip("未设置 DATABASE_URL，跳过需要数据库的集成测试")
 	}
 
-	ctx := context.Background()
-	pool, err := postgres.New(ctx, dsn)
+	pool, err := postgres.New(context.Background(), dsn)
 	if err != nil {
 		t.Fatalf("连接数据库失败: %v", err)
 	}
 	t.Cleanup(pool.Close)
+	return pool
+}
+
+// newTestService 建一个接真实 PG 的 Service。Redis 客户端是惰性连接的，
+// 而本文件测的路径（下单/库存）不碰 Redis，所以不需要 Redis 实际在线。
+func newTestService(t *testing.T) (*service.Service, *pgxpool.Pool) {
+	t.Helper()
+
+	pool := newTestPool(t)
 
 	svc := service.New(service.Deps{
 		Q:            repo.New(pool),

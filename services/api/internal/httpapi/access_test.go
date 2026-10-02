@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -10,6 +11,8 @@ import (
 	"time"
 
 	"github.com/tutic/itiao-mall/services/api/internal/auth"
+	"github.com/tutic/itiao-mall/services/api/internal/domain"
+	"github.com/tutic/itiao-mall/services/api/internal/service"
 )
 
 // 这组测试盯的是**越权**：三种角色各自能进哪段路径。
@@ -54,9 +57,12 @@ func TestRoutePolicy_AccessMatrix(t *testing.T) {
 		{"商户改商品", http.MethodPut, "/api/v1/merchant/products/x", levelRoles, "只有 merchant"},
 		{"商户订单", http.MethodGet, "/api/v1/merchant/orders", levelRoles, "只有 merchant"},
 		{"商户发货", http.MethodPost, "/api/v1/merchant/orders/x/ship", levelRoles, "只有 merchant"},
+		{"入驻资料", http.MethodGet, "/api/v1/merchant/profile", levelRoles, "只有 merchant"},
+		{"改入驻资料", http.MethodPut, "/api/v1/merchant/profile", levelRoles, "只有 merchant"},
 
 		// ---- 管理员端 ----
 		{"审核商户队列", http.MethodGet, "/api/v1/admin/merchants", levelRoles, "只有 admin"},
+		{"审核商户", http.MethodPost, "/api/v1/admin/merchants/x/review", levelRoles, "只有 admin"},
 		{"审核商品队列", http.MethodGet, "/api/v1/admin/products", levelRoles, "只有 admin"},
 
 		// ---- 必须被拒绝 ----
@@ -100,6 +106,7 @@ func TestRoutePolicy_RoleAssignment(t *testing.T) {
 		{"/api/v1/merchant/orders", []string{auth.RoleMerchant}},
 		{"/api/v1/merchant/profile", []string{auth.RoleMerchant}},
 		{"/api/v1/admin/merchants", []string{auth.RoleAdmin}},
+		{"/api/v1/admin/merchants/x/review", []string{auth.RoleAdmin}},
 		{"/api/v1/admin/products", []string{auth.RoleAdmin}},
 	}
 
@@ -127,6 +134,55 @@ func TestRoutePolicy_RoleAssignment(t *testing.T) {
 		if a.level == levelRoles && len(a.roles) != 1 {
 			t.Fatalf("%s 绑定了 %d 个角色（%v），当前设计里每个端点只归一个角色",
 				a.prefix, len(a.roles), a.roles)
+		}
+	}
+}
+
+// 入驻审核豁免名单必须是**恰好**一条，而且只可能是 profile。
+//
+// 这条守卫盯的是一个后果很重的错误方向：把某条商户业务接口的 requireApprovedMerchant
+// 漏设成 false，那个接口就会对「审核中」甚至「已停用」的商户开放 —— 上线后表现为
+// 被平台停掉的商户照样能卖货，而单元测试全绿（因为没人断言过这个维度）。
+//
+// 用"恰好相等"而不是"包含 profile"：包含式断言抓不到"新加了一条豁免"。
+func TestRoutePolicy_MerchantApprovalExemptions(t *testing.T) {
+	const exempt = "/api/v1/merchant/profile"
+
+	table := routePolicy("mock")
+
+	var unprotected []string
+	var sawExempt bool
+	for _, a := range table {
+		if !strings.HasPrefix(a.prefix, "/api/v1/merchant") {
+			continue
+		}
+		if a.requireApprovedMerchant {
+			continue
+		}
+		unprotected = append(unprotected, a.prefix)
+		if a.prefix == exempt {
+			sawExempt = true
+		}
+	}
+
+	// 下限断言：万一前缀改了或表被重构，这条测试会真空通过。先钉住豁免项确实在表里。
+	if !sawExempt {
+		t.Fatalf("策略表里找不到 %s —— 这条守卫已经失效（真空通过）", exempt)
+	}
+	if len(unprotected) != 1 {
+		t.Fatalf("免入驻审核的商户路径应**恰好**只有 %s，实际有 %d 条：%v\n"+
+			"（每一条例外都是一条「未通过审核也能操作」的路径，加之前先想清楚）",
+			exempt, len(unprotected), unprotected)
+	}
+
+	// 反向断言：豁免名单之外的商户路径必须全部要求已通过审核。
+	// 上一条只保证"只有一个例外"，这条保证"宽的那一条确实是 profile"。
+	for _, a := range table {
+		if !strings.HasPrefix(a.prefix, "/api/v1/merchant") || a.prefix == exempt {
+			continue
+		}
+		if !a.requireApprovedMerchant {
+			t.Fatalf("%s 没有要求入驻审核通过 —— 平台停用/驳回之后它仍然可用", a.prefix)
 		}
 	}
 }
@@ -386,5 +442,150 @@ func TestAuthGate_RejectsBadTokens(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// ---------- 入驻审核闸门（merchantStatusGate） ----------
+
+const testPendingMerchantID = "22222222-2222-4222-8222-222222222222"
+
+// statusLookupStub 按 userID 返回预设状态；未预设的按"从未入驻"处理。
+func statusLookupStub(statuses map[string]string) merchantStatusLookup {
+	return func(_ context.Context, userID string) (string, error) {
+		if s, ok := statuses[userID]; ok {
+			return s, nil
+		}
+		return "", domain.ErrNotFound
+	}
+}
+
+// merchantGateChain 串起真实的两层闸门：authGate → merchantStatusGate。
+func merchantGateChain(t *testing.T, statuses map[string]string) (http.Handler, *auth.TokenIssuer) {
+	t.Helper()
+	issuer := auth.NewTokenIssuer("test-secret", time.Minute)
+	terminal := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	h := authGate(issuer, "mock")(
+		merchantStatusGate(routePolicy("mock"), statusLookupStub(statuses))(terminal))
+	return h, issuer
+}
+
+// ★ 这一组是「平台停掉一个商户之后，他还能不能继续卖货」的守卫。
+//
+// 为什么必须测到这一层：策略表只说了「这条路只给 merchant 角色」，
+// 而「这个 merchant 现在被允许经营吗」是另一件事、在另一张表里。
+// 漏掉的话，一个被 REJECTED / SUSPENDED 的商户拿着自己那个还有效的 access token
+// 依然能调 /merchant/orders —— 而这恰恰是平台最需要立刻止损的时刻。
+//
+// 同时**必须**断言 profile 是豁免的：豁免没生效的话，被驳回的商户读不到自己的驳回理由，
+// 只能反复盲提交或干脆重新注册，平台侧的沟通成本被推高。
+func TestMerchantStatusGate_BlocksUnapprovedMerchants(t *testing.T) {
+	statuses := map[string]string{
+		testUserID:            service.MerchantApproved,
+		testPendingMerchantID: service.MerchantPending,
+	}
+	h, issuer := merchantGateChain(t, statuses)
+
+	issue := func(t *testing.T, userID, role string) string {
+		t.Helper()
+		tok, _, err := issuer.IssueAccess(userID, role)
+		if err != nil {
+			t.Fatalf("签发 token 失败: %v", err)
+		}
+		return tok
+	}
+
+	cases := []struct {
+		name     string
+		userID   string
+		role     string
+		method   string
+		path     string
+		wantCode int
+	}{
+		// 已通过：业务接口放行
+		{"已通过商户访问订单", testUserID, auth.RoleMerchant, http.MethodGet, "/api/v1/merchant/orders", http.StatusOK},
+		{"已通过商户访问商品", testUserID, auth.RoleMerchant, http.MethodGet, "/api/v1/merchant/products", http.StatusOK},
+
+		// 审核中：业务接口必须挡住
+		{"审核中商户访问订单", testPendingMerchantID, auth.RoleMerchant, http.MethodGet, "/api/v1/merchant/orders", http.StatusForbidden},
+		{"审核中商户访问商品", testPendingMerchantID, auth.RoleMerchant, http.MethodGet, "/api/v1/merchant/products", http.StatusForbidden},
+		{"审核中商户发货", testPendingMerchantID, auth.RoleMerchant, http.MethodPost, "/api/v1/merchant/orders/x/ship", http.StatusForbidden},
+
+		// ★ 豁免：profile 对任何状态都开放，否则被驳回的人看不到驳回理由
+		{"审核中商户读自己的资料", testPendingMerchantID, auth.RoleMerchant, http.MethodGet, "/api/v1/merchant/profile", http.StatusOK},
+		{"审核中商户改自己的资料", testPendingMerchantID, auth.RoleMerchant, http.MethodPut, "/api/v1/merchant/profile", http.StatusOK},
+
+		// 从未入驻（库里没有 profile 行）：同样按"不能经营"处理
+		{"无入驻记录的商户访问订单", "33333333-3333-4333-8333-333333333333", auth.RoleMerchant,
+			http.MethodGet, "/api/v1/merchant/orders", http.StatusForbidden},
+
+		// 非商户角色不该受本层影响：authGate 早就把它挡住了，回的还是 403。
+		// 这条是为了钉住「顺序没被改坏」—— 如果 merchantStatusGate 跑到 authGate 前面，
+		// 它会因为拿不到 claims 而回 401，这条就会红。
+		{"用户打商户端", testUserID, auth.RoleUser, http.MethodGet, "/api/v1/merchant/orders", http.StatusForbidden},
+
+		// 用户端路径完全不受这一层影响
+		{"用户端购物车不受影响", testUserID, auth.RoleUser, http.MethodGet, "/api/v1/cart", http.StatusOK},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(tc.method, tc.path, nil)
+			req.Header.Set("Authorization", "Bearer "+issue(t, tc.userID, tc.role))
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+
+			if rec.Code != tc.wantCode {
+				t.Fatalf("%s %s（userID=%s）应返回 %d，实际 %d；body=%s",
+					tc.method, tc.path, tc.userID, tc.wantCode, rec.Code, rec.Body.String())
+			}
+		})
+	}
+}
+
+// 被挡下时，响应里必须带上**当前状态**。
+//
+// 前端要靠它决定跳「审核中」还是「已驳回（展示理由）」——只回一句"无权限"的话，
+// 商户会以为自己做错了什么，而实际上只是还没审完。
+func TestMerchantStatusGate_ReportsCurrentStatus(t *testing.T) {
+	h, issuer := merchantGateChain(t, map[string]string{
+		testPendingMerchantID: service.MerchantRejected,
+	})
+	tok, _, err := issuer.IssueAccess(testPendingMerchantID, auth.RoleMerchant)
+	if err != nil {
+		t.Fatalf("签发 token 失败: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/merchant/products", nil)
+	req.Header.Set("Authorization", "Bearer "+tok)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("已驳回的商户应 403，实际 %d", rec.Code)
+	}
+	if body := rec.Body.String(); !strings.Contains(body, service.MerchantRejected) {
+		t.Fatalf("响应里应带上当前状态 %s，实际 body=%s", service.MerchantRejected, body)
+	}
+}
+
+// 从未入驻（没有 profile 行）与「审核未通过」对外必须同形：都是 403 + 一句可路由的提示。
+// 区分这两者只会泄露「这个账号存在但没有资料」。
+func TestMerchantStatusGate_NoProfileIsAlsoForbidden(t *testing.T) {
+	h, issuer := merchantGateChain(t, nil)
+	tok, _, err := issuer.IssueAccess(testPendingMerchantID, auth.RoleMerchant)
+	if err != nil {
+		t.Fatalf("签发 token 失败: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/merchant/products", nil)
+	req.Header.Set("Authorization", "Bearer "+tok)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("无入驻记录应 403，实际 %d；body=%s", rec.Code, rec.Body.String())
 	}
 }

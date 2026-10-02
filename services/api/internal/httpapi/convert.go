@@ -144,6 +144,43 @@ func toGenOrderItem(it repo.OrderItem) gen.OrderItem {
 	}
 }
 
+// ---- 商户入驻 ----
+
+// toGenMerchantProfile 把领域视图翻成契约类型。
+//
+// 空串 → 省略字段（而不是回一个空字符串）：
+// 契约里这些字段都是 optional，省略能让客户端用 `?? 兜底` 这种惯用法，
+// 而回空串会让它无法区分「没有值」和「值就是空的」。
+func toGenMerchantProfile(v *service.MerchantProfileView) gen.MerchantProfile {
+	out := gen.MerchantProfile{
+		UserId:     toUUID(v.UserID),
+		ShopName:   v.ShopName,
+		Status:     gen.MerchantProfileStatus(v.Status),
+		CreatedAt:  v.CreatedAt,
+		UpdatedAt:  v.UpdatedAt,
+		ReviewedAt: v.ReviewedAt,
+	}
+	if v.ContactName != "" {
+		out.ContactName = &v.ContactName
+	}
+	if v.ContactPhone != "" {
+		out.ContactPhone = &v.ContactPhone
+	}
+	if v.Description != "" {
+		out.Description = &v.Description
+	}
+	if v.LogoURL != "" {
+		out.LogoUrl = &v.LogoURL
+	}
+	if v.RejectReason != "" {
+		out.RejectReason = &v.RejectReason
+	}
+	if v.Phone != "" {
+		out.Phone = &v.Phone
+	}
+	return out
+}
+
 func toGenOrder(v *service.OrderView) gen.Order {
 	items := make([]gen.OrderItem, 0, len(v.Items))
 	for _, it := range v.Items {

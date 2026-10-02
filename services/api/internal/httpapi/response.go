@@ -64,6 +64,8 @@ func mapError(err error) (int, string) {
 		return http.StatusConflict, "库存不足"
 	case errors.Is(err, domain.ErrCartEmpty):
 		return http.StatusBadRequest, "购物车为空"
+	case errors.Is(err, domain.ErrValidation):
+		return http.StatusBadRequest, "参数校验失败"
 	case errors.Is(err, domain.ErrConflict):
 		return http.StatusConflict, "资源冲突"
 	case errors.Is(err, domain.ErrInvalidTransition), errors.Is(err, domain.ErrPaymentNotPending):
@@ -75,6 +77,10 @@ func mapError(err error) (int, string) {
 	case errors.Is(err, auth.ErrRefreshInvalid), errors.Is(err, auth.ErrInvalidToken),
 		errors.Is(err, domain.ErrUnauthorized), errors.Is(err, domain.ErrInvalidCredentials):
 		return http.StatusUnauthorized, "未认证或凭证无效"
+	case errors.Is(err, domain.ErrMerchantNotApproved):
+		// 与普通 ErrForbidden 分开：客户端拿到这条应该跳「入驻进度」页，
+		// 而不是显示"无权限"把用户晾在那儿。
+		return http.StatusForbidden, "商户入驻未通过审核"
 	case errors.Is(err, domain.ErrForbidden):
 		return http.StatusForbidden, "无权限"
 	default:

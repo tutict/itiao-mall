@@ -28,6 +28,10 @@ tags:
     description: 订单
   - name: payment
     description: 支付
+  - name: merchant
+    description: 商户端（入驻、商品、履约）
+  - name: admin
+    description: 平台运营（审核）
 
 paths:
   /healthz:
@@ -414,6 +418,144 @@ paths:
         default:
           $ref: '#/components/responses/Problem'
 
+  /api/v1/auth/merchant/register:
+    post:
+      operationId: registerMerchant
+      summary: 商户自助注册（注册即待审核）
+      description: |
+        注册成功**不代表可以卖货**：新商户的入驻资料是 `PENDING`，在平台审核通过之前，
+        除 `GET/PUT /api/v1/merchant/profile` 之外的所有 `/api/v1/merchant/*` 都会 403。
+
+        注册成功直接签发会话，让商户能立刻进入「查看进度 / 补资料」页面。
+        不这么做的话前端要先把他弹回登录页，多一步且无意义。
+
+        审核状态**不放进 JWT**：claims 是自包含的，审核被驳回后旧 token 依然有效，
+        那等于留一个越权窗口。所以每次请求都查库判定。
+      tags: [merchant]
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MerchantRegisterRequest'
+      responses:
+        '201':
+          description: 注册成功，入驻资料待审核
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthSession'
+        default:
+          $ref: '#/components/responses/Problem'
+
+  /api/v1/merchant/profile:
+    get:
+      operationId: getMerchantProfile
+      summary: 查看自己的入驻资料与审核状态
+      description: |
+        这个接口**刻意不要求审核通过**。它是商户查询审核进度、被驳回后看理由的唯一入口；
+        把它一起卡掉的话，被驳回的商户连"为什么被驳回"都看不到，只能盲目重复提交。
+      tags: [merchant]
+      responses:
+        '200':
+          description: 入驻资料
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MerchantProfile'
+        default:
+          $ref: '#/components/responses/Problem'
+    put:
+      operationId: updateMerchantProfile
+      summary: 更新入驻资料 / 被驳回后重新提交
+      description: |
+        状态流转：
+        - `PENDING`、`APPROVED`、`SUSPENDED`：只改资料，状态不动；
+        - `REJECTED`：改资料并**重新进入 `PENDING`**，同时清空驳回理由。
+
+        审核通过之后改店铺资料不会重新触发审核 —— 刻意如此：如果改个联系方式都要重审，
+        商户会倾向于干脆不改，平台数据反而更陈旧。需要复核时平台可以主动置为 `SUSPENDED`。
+      tags: [merchant]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MerchantProfileUpdateRequest'
+      responses:
+        '200':
+          description: 更新后的入驻资料
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MerchantProfile'
+        default:
+          $ref: '#/components/responses/Problem'
+
+  /api/v1/admin/merchants:
+    get:
+      operationId: listMerchants
+      summary: 商户入驻审核队列
+      tags: [admin]
+      parameters:
+        - name: status
+          in: query
+          description: 不传返回全部
+          schema:
+            $ref: '#/components/schemas/MerchantProfileStatus'
+        - name: page
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            default: 1
+        - name: page_size
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+      responses:
+        '200':
+          description: 商户分页
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MerchantProfilePage'
+        default:
+          $ref: '#/components/responses/Problem'
+
+  /api/v1/admin/merchants/{merchantId}/review:
+    post:
+      operationId: reviewMerchant
+      summary: 审核商户入驻
+      description: |
+        只有 `PENDING` 的申请能被裁决。服务端用 CAS 更新
+        （`WHERE user_id = ? AND status = 'PENDING'`）：两个管理员同时点「通过 / 驳回」时
+        只有一个生效，另一个拿到 404。不会出现「先通过、后驳回」互相覆盖的中间态。
+
+        驳回必须给理由，服务端强制校验 —— 没有理由的话商户只能反复盲提交，审核成本更高。
+      tags: [admin]
+      parameters:
+        - $ref: '#/components/parameters/MerchantId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MerchantReviewRequest'
+      responses:
+        '200':
+          description: 审核后的入驻资料
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MerchantProfile'
+        default:
+          $ref: '#/components/responses/Problem'
+
 components:
   securitySchemes:
     bearerAuth:
@@ -440,6 +582,14 @@ components:
       name: orderId
       in: path
       required: true
+      schema:
+        type: string
+        format: uuid
+    MerchantId:
+      name: merchantId
+      in: path
+      required: true
+      description: 商户的用户 ID（merchant_profiles.user_id）
       schema:
         type: string
         format: uuid
@@ -490,7 +640,7 @@ components:
 
     UserRole:
       type: string
-      enum: [user, merchant]
+      enum: [user, merchant, admin]
 
     User:
       type: object
@@ -537,6 +687,129 @@ components:
       properties:
         refresh_token:
           type: string
+
+    # ---------------- 商户入驻与审核 ----------------
+
+    MerchantProfileStatus:
+      type: string
+      description: |
+        入驻审核状态。`SUSPENDED` 由平台在已通过之后主动停用（违规、纠纷、资料失效）。
+      enum: [PENDING, APPROVED, REJECTED, SUSPENDED]
+
+    MerchantReviewDecision:
+      type: string
+      description: 审核结论。只能批准或驳回 —— 「挂起」不是审核动作，是事后处置。
+      enum: [APPROVED, REJECTED]
+
+    MerchantProfile:
+      type: object
+      required: [user_id, shop_name, status, created_at, updated_at]
+      properties:
+        user_id:
+          type: string
+          format: uuid
+        shop_name:
+          type: string
+        contact_name:
+          type: string
+        contact_phone:
+          type: string
+        description:
+          type: string
+        logo_url:
+          type: string
+        phone:
+          type: string
+          nullable: true
+          description: 登录手机号。商户看自己的；管理员审核时也靠它对上号。
+        status:
+          $ref: '#/components/schemas/MerchantProfileStatus'
+        reject_reason:
+          type: string
+          description: 仅 `REJECTED` 时有值。重新提交后清空。
+        reviewed_at:
+          type: string
+          format: date-time
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    MerchantProfilePage:
+      type: object
+      required: [items, total, page, page_size]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/MerchantProfile'
+        total:
+          type: integer
+        page:
+          type: integer
+        page_size:
+          type: integer
+
+    MerchantRegisterRequest:
+      type: object
+      required: [phone, password, shop_name]
+      properties:
+        phone:
+          type: string
+          minLength: 1
+          maxLength: 32
+          description: 登录手机号，全局唯一
+        password:
+          type: string
+          format: password
+          minLength: 8
+          maxLength: 128
+          description: 至少 8 位。服务端强制校验（契约里的 minLength 只用于生成文档与类型，不做运行时拦截）
+        shop_name:
+          type: string
+          minLength: 1
+          maxLength: 100
+        contact_name:
+          type: string
+          maxLength: 50
+        contact_phone:
+          type: string
+          maxLength: 32
+
+    MerchantProfileUpdateRequest:
+      type: object
+      required: [shop_name]
+      properties:
+        shop_name:
+          type: string
+          minLength: 1
+          maxLength: 100
+        contact_name:
+          type: string
+          maxLength: 50
+        contact_phone:
+          type: string
+          maxLength: 32
+        description:
+          type: string
+          maxLength: 1000
+        logo_url:
+          type: string
+          maxLength: 500
+
+    MerchantReviewRequest:
+      type: object
+      required: [decision]
+      properties:
+        decision:
+          $ref: '#/components/schemas/MerchantReviewDecision'
+        reject_reason:
+          type: string
+          maxLength: 500
+          description: '`decision=REJECTED` 时必填，服务端强制校验'
 
     AuthSession:
       type: object

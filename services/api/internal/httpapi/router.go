@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -45,18 +46,7 @@ type Deps struct {
 func NewRouter(d Deps) http.Handler {
 	r := chi.NewRouter()
 
-	r.Use(RequestID)
-	r.Use(AccessLog(d.Logger))
-	r.Use(Recoverer)
-	r.Use(chimw.RealIP)
-	r.Use(chimw.Timeout(30 * time.Second))
-	r.Use(CORS(CORSConfig{AllowedOrigins: d.CORSOrigins, AllowLocalhost: d.CORSAllowLocal}))
-	r.Use(authGate(d.Issuer, d.Payment.Name()))
-
-	// /readyz 不在契约里：它是编排层面的探针，不该因为 API 契约变动而抖动。
-	// /healthz 则由契约生成（见 openapi.yaml），这样它的形状有漂移门禁兜底。
-	r.Get("/readyz", readyz(d))
-
+	// 业务层先于中间件构建：merchantStatusGate 需要用它查库确认入驻状态。
 	svc := service.New(service.Deps{
 		Q:            repo.New(d.Pool),
 		Pool:         d.Pool,
@@ -68,6 +58,22 @@ func NewRouter(d Deps) http.Handler {
 		Logger:       d.Logger,
 		PendingTTL:   d.PendingTTL,
 	})
+
+	table := routePolicy(d.Payment.Name())
+
+	r.Use(RequestID)
+	r.Use(AccessLog(d.Logger))
+	r.Use(Recoverer)
+	r.Use(chimw.RealIP)
+	r.Use(chimw.Timeout(30 * time.Second))
+	r.Use(CORS(CORSConfig{AllowedOrigins: d.CORSOrigins, AllowLocalhost: d.CORSAllowLocal}))
+	r.Use(authGate(d.Issuer, d.Payment.Name()))
+	// 必须排在 authGate **之后**：它要读 authGate 放进 context 的 claims。
+	r.Use(merchantStatusGate(table, svc.MerchantStatus))
+
+	// /readyz 不在契约里：它是编排层面的探针，不该因为 API 契约变动而抖动。
+	// /healthz 则由契约生成（见 openapi.yaml），这样它的形状有漂移门禁兜底。
+	r.Get("/readyz", readyz(d))
 
 	strict := gen.NewStrictHandlerWithOptions(NewHandler(svc), nil, gen.StrictHTTPServerOptions{
 		// 业务错误 → RFC7807。所有状态码映射都收敛在 WriteProblem 一处。
@@ -171,4 +177,60 @@ func bearerToken(r *http.Request) string {
 		return strings.TrimSpace(h[len(prefix):])
 	}
 	return ""
+}
+
+// merchantStatusLookup 查一个商户当前的入驻状态。查不到返回 domain.ErrNotFound。
+type merchantStatusLookup func(ctx context.Context, userID string) (string, error)
+
+// merchantStatusGate 拦的是**业务资格的缺失**，不是身份的缺失。
+//
+// 为什么要独立成一层，而不是塞进 authGate：
+//   - authGate 只解 token，零 IO，可以认为它永远便宜；这一层每次请求都要查一次库。
+//     合在一起会让"认证开销"这个本来确定的量变得不确定。
+//   - 更重要的是语义不同。authGate 回答「你是谁」，这一层回答「你现在被允许经营吗」。
+//     后者是**随时间变化的**（今天驳回、明天通过），所以每次都要重新问。
+//     而 token 里冻结的身份是签发那一刻的快照 —— 把审核状态编进 token，
+//     等于给被驳回的商户留一个「token 过期前照常卖货」的窗口，
+//     而这个窗口恰恰出现在最需要立刻止损的时刻。
+//
+// 只对策略表里标了 requireApprovedMerchant 的路径生效。/api/v1/merchant/profile
+// 刻意不标 —— 它是被驳回的商户唯一能读到自己驳回理由的地方，一起卡掉就等于
+// 切断了他和平台之间的沟通渠道，只能重新注册账号。
+//
+// SUSPENDED 也在这里被挡（只放行 APPROVED）。SUSPENDED 是平台的事后处置，
+// 存在的意义就是立刻停掉经营动作；如果它还能源源不断地卖货，这个状态就是摆设。
+func merchantStatusGate(table []access, lookup merchantStatusLookup) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if !policyFor(table, r.Method, r.URL.Path).requireApprovedMerchant {
+				next.ServeHTTP(w, r)
+				return
+			}
+
+			claims, ok := auth.FromContext(r.Context())
+			if !ok {
+				// 正常路径下 authGate 已经放好 claims 了。走到这里说明中间件顺序被改坏。
+				// 报 401 而不是放行 —— 宁可功能不通，也不能静默退化成"这一层不生效"。
+				WriteProblem(w, r, domain.ErrUnauthorized)
+				return
+			}
+
+			status, err := lookup(r.Context(), claims.UserID)
+			if err != nil {
+				if errors.Is(err, domain.ErrNotFound) {
+					// 从未提交入驻资料。对外与"审核未通过"同形 —— 都是"你现在不能经营"。
+					WriteProblem(w, r, fmt.Errorf("%w: 尚未提交入驻资料", domain.ErrMerchantNotApproved))
+					return
+				}
+				WriteProblem(w, r, err)
+				return
+			}
+			if status != service.MerchantApproved {
+				WriteProblem(w, r, fmt.Errorf("%w: 当前入驻状态为 %s",
+					domain.ErrMerchantNotApproved, status))
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
 }

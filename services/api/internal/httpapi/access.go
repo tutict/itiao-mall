@@ -30,6 +30,18 @@ type access struct {
 	prefix  string
 	methods []string // 空 = 不限方法
 	roles   []string // 仅 levelRoles 时生效
+
+	// requireApprovedMerchant 表示这条路径额外要求「商户入驻已通过」。
+	//
+	// 它是一个**独立的维度**，不并入 level：「需要登录且是商户」与「这个商户已经被平台放行」
+	// 是两件事，第一件在 token 里，第二件只有在库里。混成一档的话，
+	// 将来加别的审核维度（实名、保证金）就得再改一遍 level 的定义。
+	//
+	// 零值是 false。这里刻意**没有**做成 fail-closed 的零值，因为零值 false 的含义
+	// 是"不做商户审核"，误用了只会漏一道业务闸，而不会绕过身份认证 ——
+	// 身份那一层由 level 兜底。为了让这个维度不靠人记，测试里钉了一条不变量：
+	// `/api/v1/merchant` 下**除 profile 外**的每一条都必须置 true。
+	requireApprovedMerchant bool
 }
 
 // matchesPath 按**路径段边界**匹配前缀。
@@ -108,7 +120,19 @@ func routePolicy(paymentProvider string) []access {
 		{level: levelRoles, prefix: "/api/v1/orders", roles: []string{auth.RoleUser}},
 
 		// 商户端业务。
-		{level: levelRoles, prefix: "/api/v1/merchant", roles: []string{auth.RoleMerchant}},
+		//
+		// ★ 顺序要紧：/api/v1/merchant/profile 必须排在 /api/v1/merchant 之前。
+		//   policyFor 返回**第一个**命中的条目，把通用条目放前面会让 profile 也吃上
+		//   「必须已通过审核」，于是被驳回的商户连自己的驳回理由都读不到 ——
+		//   他和平台的沟通渠道被彻底切断，只能重新注册一个号。
+		//
+		// profile 是唯一豁免入驻审核的商户接口：它是"查进度 / 看驳回理由 / 重新提交"
+		//   这三个动作的载体，必须对 PENDING 和 REJECTED 也开放。
+		{level: levelRoles, prefix: "/api/v1/merchant/profile", roles: []string{auth.RoleMerchant}},
+		// 其余商户业务一律要求入驻已通过。
+		//   注意这里**含 SUSPENDED 也被挡住**：SUSPENDED 是平台事后处置（违规、纠纷），
+		//   它存在的意义就是立刻停掉这个商户的经营动作。如果它还能照常卖货，这个状态就是摆设。
+		{level: levelRoles, prefix: "/api/v1/merchant", roles: []string{auth.RoleMerchant}, requireApprovedMerchant: true},
 
 		// 平台运营。管理员**不能**走商户端接口 —— 平台身份与商户身份刻意不重叠，
 		// 否则「这次操作到底是谁干的」在审计上说不清。

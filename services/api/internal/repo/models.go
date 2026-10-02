@@ -25,6 +25,21 @@ type IdempotencyKey struct {
 	CreatedAt pgtype.Timestamptz `json:"created_at"`
 }
 
+type MerchantProfile struct {
+	UserID       string             `json:"user_id"`
+	ShopName     string             `json:"shop_name"`
+	ContactName  string             `json:"contact_name"`
+	ContactPhone string             `json:"contact_phone"`
+	Description  string             `json:"description"`
+	LogoUrl      string             `json:"logo_url"`
+	Status       string             `json:"status"`
+	RejectReason string             `json:"reject_reason"`
+	ReviewedBy   pgtype.UUID        `json:"reviewed_by"`
+	ReviewedAt   pgtype.Timestamptz `json:"reviewed_at"`
+	CreatedAt    pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt    pgtype.Timestamptz `json:"updated_at"`
+}
+
 type Order struct {
 	ID             string             `json:"id"`
 	OrderNo        string             `json:"order_no"`
@@ -61,15 +76,19 @@ type PaymentEvent struct {
 }
 
 type Product struct {
-	ID          string             `json:"id"`
-	MerchantID  string             `json:"merchant_id"`
-	Title       string             `json:"title"`
-	Description string             `json:"description"`
-	Category    string             `json:"category"`
-	CoverUrl    string             `json:"cover_url"`
-	Status      string             `json:"status"`
-	CreatedAt   pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt   pgtype.Timestamptz `json:"updated_at"`
+	ID           string             `json:"id"`
+	MerchantID   string             `json:"merchant_id"`
+	Title        string             `json:"title"`
+	Description  string             `json:"description"`
+	Category     string             `json:"category"`
+	CoverUrl     string             `json:"cover_url"`
+	Status       string             `json:"status"`
+	CreatedAt    pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt    pgtype.Timestamptz `json:"updated_at"`
+	RejectReason string             `json:"reject_reason"`
+	SubmittedAt  pgtype.Timestamptz `json:"submitted_at"`
+	ReviewedBy   pgtype.UUID        `json:"reviewed_by"`
+	ReviewedAt   pgtype.Timestamptz `json:"reviewed_at"`
 }
 
 type Sku struct {

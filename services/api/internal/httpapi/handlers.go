@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 
 	"github.com/tutic/itiao-mall/services/api/internal/auth"
 	"github.com/tutic/itiao-mall/services/api/internal/domain"
@@ -260,6 +261,109 @@ func (h *Handler) GetOrder(ctx context.Context, req gen.GetOrderRequestObject) (
 		return nil, err
 	}
 	return gen.GetOrder200JSONResponse(toGenOrder(view)), nil
+}
+
+// ---------- 商户入驻 ----------
+
+// RegisterMerchant 商户自助注册。注册即建号，但入驻资料是 PENDING ——
+// 在平台放行之前，除 profile 之外的商户接口都会被 merchantStatusGate 挡掉。
+func (h *Handler) RegisterMerchant(ctx context.Context, req gen.RegisterMerchantRequestObject) (gen.RegisterMerchantResponseObject, error) {
+	if req.Body == nil {
+		return nil, fmt.Errorf("%w: 请求体为空", domain.ErrValidation)
+	}
+	sess, err := h.svc.RegisterMerchant(ctx, service.MerchantRegisterInput{
+		Phone:        strings.TrimSpace(req.Body.Phone),
+		Password:     req.Body.Password,
+		ShopName:     strings.TrimSpace(req.Body.ShopName),
+		ContactName:  strings.TrimSpace(derefStr(req.Body.ContactName)),
+		ContactPhone: strings.TrimSpace(derefStr(req.Body.ContactPhone)),
+	})
+	if err != nil {
+		return nil, err
+	}
+	return gen.RegisterMerchant201JSONResponse(toGenSession(sess)), nil
+}
+
+func (h *Handler) GetMerchantProfile(ctx context.Context, _ gen.GetMerchantProfileRequestObject) (gen.GetMerchantProfileResponseObject, error) {
+	claims, err := mustUser(ctx)
+	if err != nil {
+		return nil, err
+	}
+	view, err := h.svc.GetMerchantProfile(ctx, claims.UserID)
+	if err != nil {
+		return nil, err
+	}
+	return gen.GetMerchantProfile200JSONResponse(toGenMerchantProfile(view)), nil
+}
+
+func (h *Handler) UpdateMerchantProfile(ctx context.Context, req gen.UpdateMerchantProfileRequestObject) (gen.UpdateMerchantProfileResponseObject, error) {
+	claims, err := mustUser(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if req.Body == nil {
+		return nil, fmt.Errorf("%w: 请求体为空", domain.ErrValidation)
+	}
+	view, err := h.svc.UpdateMerchantProfile(ctx, claims.UserID, service.MerchantProfileInput{
+		ShopName:     strings.TrimSpace(req.Body.ShopName),
+		ContactName:  strings.TrimSpace(derefStr(req.Body.ContactName)),
+		ContactPhone: strings.TrimSpace(derefStr(req.Body.ContactPhone)),
+		Description:  strings.TrimSpace(derefStr(req.Body.Description)),
+		LogoURL:      strings.TrimSpace(derefStr(req.Body.LogoUrl)),
+	})
+	if err != nil {
+		return nil, err
+	}
+	return gen.UpdateMerchantProfile200JSONResponse(toGenMerchantProfile(view)), nil
+}
+
+// ---------- 平台审核 ----------
+
+func (h *Handler) ListMerchants(ctx context.Context, req gen.ListMerchantsRequestObject) (gen.ListMerchantsResponseObject, error) {
+	page := derefInt32(req.Params.Page, 1)
+	pageSize := derefInt32(req.Params.PageSize, 20)
+
+	status := ""
+	if req.Params.Status != nil {
+		status = string(*req.Params.Status)
+	}
+
+	views, total, err := h.svc.ListMerchantProfiles(ctx, status, page, pageSize)
+	if err != nil {
+		return nil, err
+	}
+
+	items := make([]gen.MerchantProfile, 0, len(views))
+	for i := range views {
+		items = append(items, toGenMerchantProfile(&views[i]))
+	}
+	return gen.ListMerchants200JSONResponse{
+		Items:    items,
+		Total:    int(total),
+		Page:     int(page),
+		PageSize: int(pageSize),
+	}, nil
+}
+
+func (h *Handler) ReviewMerchant(ctx context.Context, req gen.ReviewMerchantRequestObject) (gen.ReviewMerchantResponseObject, error) {
+	claims, err := mustUser(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if req.Body == nil {
+		return nil, fmt.Errorf("%w: 请求体为空", domain.ErrValidation)
+	}
+	view, err := h.svc.ReviewMerchant(
+		ctx,
+		claims.UserID,
+		req.MerchantId.String(),
+		string(req.Body.Decision),
+		derefStr(req.Body.RejectReason),
+	)
+	if err != nil {
+		return nil, err
+	}
+	return gen.ReviewMerchant200JSONResponse(toGenMerchantProfile(view)), nil
 }
 
 // ---------- 支付 ----------

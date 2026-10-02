@@ -99,7 +99,7 @@ func (q *Queries) CreateWechatUser(ctx context.Context, arg CreateWechatUserPara
 }
 
 const getProductByID = `-- name: GetProductByID :one
-SELECT id, merchant_id, title, description, category, cover_url, status, created_at, updated_at FROM products WHERE id = $1::uuid LIMIT 1
+SELECT id, merchant_id, title, description, category, cover_url, status, created_at, updated_at, reject_reason, submitted_at, reviewed_by, reviewed_at FROM products WHERE id = $1::uuid LIMIT 1
 `
 
 func (q *Queries) GetProductByID(ctx context.Context, id string) (Product, error) {
@@ -115,6 +115,10 @@ func (q *Queries) GetProductByID(ctx context.Context, id string) (Product, error
 		&i.Status,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.RejectReason,
+		&i.SubmittedAt,
+		&i.ReviewedBy,
+		&i.ReviewedAt,
 	)
 	return i, err
 }

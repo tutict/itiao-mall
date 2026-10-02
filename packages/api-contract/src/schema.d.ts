@@ -291,6 +291,104 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/auth/merchant/register": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 商户自助注册（注册即待审核）
+         * @description 注册成功**不代表可以卖货**：新商户的入驻资料是 `PENDING`，在平台审核通过之前，
+         *     除 `GET/PUT /api/v1/merchant/profile` 之外的所有 `/api/v1/merchant/*` 都会 403。
+         *
+         *     注册成功直接签发会话，让商户能立刻进入「查看进度 / 补资料」页面。
+         *     不这么做的话前端要先把他弹回登录页，多一步且无意义。
+         *
+         *     审核状态**不放进 JWT**：claims 是自包含的，审核被驳回后旧 token 依然有效，
+         *     那等于留一个越权窗口。所以每次请求都查库判定。
+         */
+        post: operations["registerMerchant"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/merchant/profile": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 查看自己的入驻资料与审核状态
+         * @description 这个接口**刻意不要求审核通过**。它是商户查询审核进度、被驳回后看理由的唯一入口；
+         *     把它一起卡掉的话，被驳回的商户连"为什么被驳回"都看不到，只能盲目重复提交。
+         */
+        get: operations["getMerchantProfile"];
+        /**
+         * 更新入驻资料 / 被驳回后重新提交
+         * @description 状态流转：
+         *     - `PENDING`、`APPROVED`、`SUSPENDED`：只改资料，状态不动；
+         *     - `REJECTED`：改资料并**重新进入 `PENDING`**，同时清空驳回理由。
+         *
+         *     审核通过之后改店铺资料不会重新触发审核 —— 刻意如此：如果改个联系方式都要重审，
+         *     商户会倾向于干脆不改，平台数据反而更陈旧。需要复核时平台可以主动置为 `SUSPENDED`。
+         */
+        put: operations["updateMerchantProfile"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/admin/merchants": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 商户入驻审核队列 */
+        get: operations["listMerchants"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/admin/merchants/{merchantId}/review": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 审核商户入驻
+         * @description 只有 `PENDING` 的申请能被裁决。服务端用 CAS 更新
+         *     （`WHERE user_id = ? AND status = 'PENDING'`）：两个管理员同时点「通过 / 驳回」时
+         *     只有一个生效，另一个拿到 404。不会出现「先通过、后驳回」互相覆盖的中间态。
+         *
+         *     驳回必须给理由，服务端强制校验 —— 没有理由的话商户只能反复盲提交，审核成本更高。
+         */
+        post: operations["reviewMerchant"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -312,7 +410,7 @@ export interface components {
          */
         OrderStatus: "CREATED" | "PENDING_PAYMENT" | "PAID" | "SHIPPED" | "COMPLETED" | "CANCELLED" | "REFUNDING" | "REFUNDED";
         /** @enum {string} */
-        UserRole: "user" | "merchant";
+        UserRole: "user" | "merchant" | "admin";
         User: {
             /** Format: uuid */
             id: string;
@@ -334,6 +432,66 @@ export interface components {
         };
         RefreshRequest: {
             refresh_token: string;
+        };
+        /**
+         * @description 入驻审核状态。`SUSPENDED` 由平台在已通过之后主动停用（违规、纠纷、资料失效）。
+         * @enum {string}
+         */
+        MerchantProfileStatus: "PENDING" | "APPROVED" | "REJECTED" | "SUSPENDED";
+        /**
+         * @description 审核结论。只能批准或驳回 —— 「挂起」不是审核动作，是事后处置。
+         * @enum {string}
+         */
+        MerchantReviewDecision: "APPROVED" | "REJECTED";
+        MerchantProfile: {
+            /** Format: uuid */
+            user_id: string;
+            shop_name: string;
+            contact_name?: string;
+            contact_phone?: string;
+            description?: string;
+            logo_url?: string;
+            /** @description 登录手机号。商户看自己的；管理员审核时也靠它对上号。 */
+            phone?: string | null;
+            status: components["schemas"]["MerchantProfileStatus"];
+            /** @description 仅 `REJECTED` 时有值。重新提交后清空。 */
+            reject_reason?: string;
+            /** Format: date-time */
+            reviewed_at?: string | null;
+            /** Format: date-time */
+            created_at: string;
+            /** Format: date-time */
+            updated_at: string;
+        };
+        MerchantProfilePage: {
+            items: components["schemas"]["MerchantProfile"][];
+            total: number;
+            page: number;
+            page_size: number;
+        };
+        MerchantRegisterRequest: {
+            /** @description 登录手机号，全局唯一 */
+            phone: string;
+            /**
+             * Format: password
+             * @description 至少 8 位。服务端强制校验（契约里的 minLength 只用于生成文档与类型，不做运行时拦截）
+             */
+            password: string;
+            shop_name: string;
+            contact_name?: string;
+            contact_phone?: string;
+        };
+        MerchantProfileUpdateRequest: {
+            shop_name: string;
+            contact_name?: string;
+            contact_phone?: string;
+            description?: string;
+            logo_url?: string;
+        };
+        MerchantReviewRequest: {
+            decision: components["schemas"]["MerchantReviewDecision"];
+            /** @description `decision=REJECTED` 时必填，服务端强制校验 */
+            reject_reason?: string;
         };
         AuthSession: {
             access_token: string;
@@ -475,6 +633,8 @@ export interface components {
         ProductId: string;
         SkuId: string;
         OrderId: string;
+        /** @description 商户的用户 ID（merchant_profiles.user_id） */
+        MerchantId: string;
     };
     requestBodies: never;
     headers: never;
@@ -886,6 +1046,131 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["MockNotifyResult"];
+                };
+            };
+            default: components["responses"]["Problem"];
+        };
+    };
+    registerMerchant: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MerchantRegisterRequest"];
+            };
+        };
+        responses: {
+            /** @description 注册成功，入驻资料待审核 */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AuthSession"];
+                };
+            };
+            default: components["responses"]["Problem"];
+        };
+    };
+    getMerchantProfile: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 入驻资料 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MerchantProfile"];
+                };
+            };
+            default: components["responses"]["Problem"];
+        };
+    };
+    updateMerchantProfile: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MerchantProfileUpdateRequest"];
+            };
+        };
+        responses: {
+            /** @description 更新后的入驻资料 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MerchantProfile"];
+                };
+            };
+            default: components["responses"]["Problem"];
+        };
+    };
+    listMerchants: {
+        parameters: {
+            query?: {
+                /** @description 不传返回全部 */
+                status?: components["schemas"]["MerchantProfileStatus"];
+                page?: number;
+                page_size?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 商户分页 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MerchantProfilePage"];
+                };
+            };
+            default: components["responses"]["Problem"];
+        };
+    };
+    reviewMerchant: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description 商户的用户 ID（merchant_profiles.user_id） */
+                merchantId: components["parameters"]["MerchantId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MerchantReviewRequest"];
+            };
+        };
+        responses: {
+            /** @description 审核后的入驻资料 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MerchantProfile"];
                 };
             };
             default: components["responses"]["Problem"];
