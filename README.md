@@ -81,6 +81,25 @@ Android 模拟器里 `localhost` 指向模拟器自己，宿主机要用 `10.0.2
 
 响应头**刻意不设** `Access-Control-Allow-Credentials`：本项目走 Bearer token，不用 Cookie。
 
+## 本地预览与 P0 验收
+
+```bash
+node scripts/preview-web.mjs --port 8081        # 预览 apps/app 的 web 导出
+node scripts/acceptance-app.mjs                 # 用真实 Chromium 跑一遍闭环并逐步截图
+```
+
+`preview-web.mjs` 不是可有可无的糖：Expo 静态导出把**动态路由**落成带方括号的占位文件
+（`product/[id].html`、`order/[id].html`），通用静态服务器只会把它当普通文件，
+请求 `/product/<uuid>` 一律 404。这个脚本补上了干净 URL 与动态路由解析，并挡住路径穿越。
+
+`acceptance-app.mjs` 走完「登录 → 商品列表 → 详情 → 加购 → 结算 → mock 支付 → 订单列表」，
+每一步截图并断言关键文案，最后写 `report.json`。它**同时是 CORS 的端到端验证**：
+App 在 `:8081`、API 在 `:8080`，浏览器里的每个请求都是跨域的。退出码即结论。
+
+两个脚本都零依赖：本机 `npm install` 在沙箱里会崩（`Cannot read properties of null
+(reading 'edgesOut')`），而 ms-playwright 缓存里已经有 Chromium，所以 `acceptance-app.mjs`
+直接讲 CDP（Node 22 自带全局 WebSocket）。找不到浏览器时用 `CHROME_PATH` 指定。
+
 ## 性能门禁：两层，分工不同
 
 **这是本项目最该先读的一段。**
