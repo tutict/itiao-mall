@@ -1,0 +1,30 @@
+# 行尾统一为 LF。
+#
+# 为什么必须显式声明：Windows 上 git 默认会把工作区的 LF 转成 CRLF（core.autocrlf），
+# 而本仓库用 `git diff --exit-code` 做**契约漂移检查** —— 生成物一旦被转换行尾，
+# 检查就会报出全文件差异，看起来像"契约被手改了"，实际只是换行符被动过。
+# 同理，shell 脚本带 CRLF 会直接执行失败。
+#
+# 结论：显式钉死 LF，别依赖各人机器的 git 配置。
+* text=auto eol=lf
+
+# Windows 专用脚本保持 CRLF
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# 二进制，不要做任何转换
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.webp binary
+*.ttf binary
+*.otf binary
+*.woff binary
+*.woff2 binary
+*.exe binary
+*.dll binary
+*.so binary
+*.dylib binary
+*.zip binary
