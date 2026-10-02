@@ -1,0 +1,9 @@
+package: gen
+output: internal/httpapi/gen/api.gen.go
+generate:
+  chi-server: true
+  strict-server: true
+  models: true
+output-options:
+  # 不要把 spec 里没被引用的 schema 裁掉 —— 否则以后新增接口时生成物会突然少东西
+  skip-prune: true

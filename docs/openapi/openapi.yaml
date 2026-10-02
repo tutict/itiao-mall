@@ -1,0 +1,765 @@
+openapi: 3.0.3
+
+info:
+  title: itiao-mall API
+  version: 0.1.0
+  description: |
+    商城 API。用户端（App）与商户端（Web）共用本契约。
+
+    **这是前后端唯一的真源。** Go 侧用 oapi-codegen 生成 server 接口，
+    TS 侧用 openapi-typescript 生成类型。改接口先改这里，再跑 `bash scripts/gen.sh`，
+    最后用 `git diff --exit-code` 卡住契约漂移。
+
+    金额一律以「分」为单位的整数表示，字段名统一带 `_cents` 后缀。
+servers:
+  - url: http://localhost:8080
+    description: 本地开发
+
+tags:
+  - name: auth
+    description: 认证
+  - name: me
+    description: 当前用户
+  - name: products
+    description: 商品（用户端查看）
+  - name: cart
+    description: 购物车
+  - name: orders
+    description: 订单
+  - name: payment
+    description: 支付
+
+paths:
+  /healthz:
+    get:
+      operationId: healthz
+      summary: 存活探针
+      tags: [ops]
+      security: []
+      responses:
+        '200':
+          description: 进程存活
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+        default:
+          $ref: '#/components/responses/Problem'
+
+  /api/v1/auth/wechat/login:
+    post:
+      operationId: loginWechat
+      summary: 微信一键登录
+      description: |
+        App 端拿到微信一次性 code 后交给后端，后端用 AppSecret 换 openid/unionid。
+        AppSecret 绝不下发客户端。`AUTH_PROVIDER=mock` 时任意 code 都会签发测试用户。
+      tags: [auth]
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WechatLoginRequest'
+      responses:
+        '200':
+          description: 登录成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthSession'
+        default:
+          $ref: '#/components/responses/Problem'
+
+  /api/v1/auth/merchant/login:
+    post:
+      operationId: loginMerchant
+      summary: 商户端登录（手机号 + 密码）
+      tags: [auth]
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MerchantLoginRequest'
+      responses:
+        '200':
+          description: 登录成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthSession'
+        default:
+          $ref: '#/components/responses/Problem'
+
+  /api/v1/auth/refresh:
+    post:
+      operationId: refreshToken
+      summary: 刷新令牌
+      description: |
+        一次性轮换：旧 refresh token 用完即废，返回新的 access + refresh。
+        若同一个已消费过的 token 再次出现，视为重放，整个 token family 会被吊销。
+      tags: [auth]
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RefreshRequest'
+      responses:
+        '200':
+          description: 刷新成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthSession'
+        default:
+          $ref: '#/components/responses/Problem'
+
+  /api/v1/auth/logout:
+    post:
+      operationId: logout
+      summary: 登出
+      tags: [auth]
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RefreshRequest'
+      responses:
+        '204':
+          description: 已登出
+        default:
+          $ref: '#/components/responses/Problem'
+
+  /api/v1/me:
+    get:
+      operationId: getMe
+      summary: 当前登录用户
+      tags: [me]
+      responses:
+        '200':
+          description: 用户信息
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        default:
+          $ref: '#/components/responses/Problem'
+
+  /api/v1/products:
+    get:
+      operationId: listProducts
+      summary: 商品列表（支持搜索与分页）
+      tags: [products]
+      security: []
+      parameters:
+        - name: q
+          in: query
+          description: 标题关键词
+          schema:
+            type: string
+        - name: category
+          in: query
+          schema:
+            type: string
+        - name: page
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            default: 1
+        - name: page_size
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+      responses:
+        '200':
+          description: 商品分页
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProductPage'
+        default:
+          $ref: '#/components/responses/Problem'
+
+  /api/v1/products/{productId}:
+    get:
+      operationId: getProduct
+      summary: 商品详情（含 SKU）
+      tags: [products]
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/ProductId'
+      responses:
+        '200':
+          description: 商品详情
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProductDetail'
+        default:
+          $ref: '#/components/responses/Problem'
+
+  /api/v1/cart:
+    get:
+      operationId: getCart
+      summary: 获取购物车
+      tags: [cart]
+      responses:
+        '200':
+          description: 购物车内容
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Cart'
+        default:
+          $ref: '#/components/responses/Problem'
+
+  /api/v1/cart/items/{skuId}:
+    put:
+      operationId: putCartItem
+      summary: 加购 / 改数量（upsert）
+      tags: [cart]
+      parameters:
+        - $ref: '#/components/parameters/SkuId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PutCartItemRequest'
+      responses:
+        '200':
+          description: 更新后的购物车
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Cart'
+        default:
+          $ref: '#/components/responses/Problem'
+    delete:
+      operationId: deleteCartItem
+      summary: 移出购物车
+      tags: [cart]
+      parameters:
+        - $ref: '#/components/parameters/SkuId'
+      responses:
+        '200':
+          description: 更新后的购物车
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Cart'
+        default:
+          $ref: '#/components/responses/Problem'
+
+  /api/v1/orders:
+    get:
+      operationId: listOrders
+      summary: 我的订单列表
+      tags: [orders]
+      parameters:
+        - name: status
+          in: query
+          schema:
+            $ref: '#/components/schemas/OrderStatus'
+        - name: page
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            default: 1
+        - name: page_size
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+      responses:
+        '200':
+          description: 订单分页
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrderPage'
+        default:
+          $ref: '#/components/responses/Problem'
+    post:
+      operationId: createOrder
+      summary: 下单
+      description: |
+        下单会以「条件更新」方式预占库存：`UPDATE skus SET stock = stock - n WHERE id = ? AND stock >= n`。
+        影响行数为 0 即库存不足，返回 409。整个下单在一个事务里完成。
+
+        传 `Idempotency-Key` 头可保证重复提交只生成一单。
+      tags: [orders]
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          schema:
+            type: string
+            maxLength: 128
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateOrderRequest'
+      responses:
+        '201':
+          description: 下单成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+        default:
+          $ref: '#/components/responses/Problem'
+
+  /api/v1/orders/{orderId}:
+    get:
+      operationId: getOrder
+      summary: 订单详情
+      tags: [orders]
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+      responses:
+        '200':
+          description: 订单详情
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+        default:
+          $ref: '#/components/responses/Problem'
+
+  /api/v1/orders/{orderId}/pay:
+    post:
+      operationId: prepayOrder
+      summary: 发起支付（预下单）
+      description: |
+        返回调起支付所需参数。`PAYMENT_PROVIDER=mock` 时返回 mock 的 prepay 参数，
+        并可通过 `POST /api/v1/pay/mock/notify` 手动触发支付成功回调。
+      tags: [payment]
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+      responses:
+        '200':
+          description: 预下单结果
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PrepayResult'
+        default:
+          $ref: '#/components/responses/Problem'
+
+  /api/v1/pay/mock/notify:
+    post:
+      operationId: mockPayNotify
+      summary: 手动触发一笔 mock 支付成功回调
+      description: |
+        **仅当 `PAYMENT_PROVIDER=mock` 时注册这条路由。**
+        压测也需要它来覆盖支付回调链路。
+      tags: [payment]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MockNotifyRequest'
+      responses:
+        '200':
+          description: 回调已处理
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MockNotifyResult'
+        default:
+          $ref: '#/components/responses/Problem'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    ProductId:
+      name: productId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    SkuId:
+      name: skuId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    OrderId:
+      name: orderId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+
+  responses:
+    Problem:
+      description: 错误响应（RFC7807 风格）
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+
+  schemas:
+    Health:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          example: ok
+
+    Problem:
+      type: object
+      required: [title, status]
+      properties:
+        type:
+          type: string
+          default: about:blank
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
+
+    OrderStatus:
+      type: string
+      description: 订单状态。流转规则见后端 state machine。
+      enum:
+        - CREATED
+        - PENDING_PAYMENT
+        - PAID
+        - SHIPPED
+        - COMPLETED
+        - CANCELLED
+        - REFUNDING
+        - REFUNDED
+
+    UserRole:
+      type: string
+      enum: [user, merchant]
+
+    User:
+      type: object
+      required: [id, role, nickname]
+      properties:
+        id:
+          type: string
+          format: uuid
+        role:
+          $ref: '#/components/schemas/UserRole'
+        nickname:
+          type: string
+        avatar_url:
+          type: string
+        phone:
+          type: string
+          nullable: true
+
+    WechatLoginRequest:
+      type: object
+      required: [code]
+      properties:
+        code:
+          type: string
+          description: 微信一次性授权 code
+        nickname:
+          type: string
+        avatar_url:
+          type: string
+
+    MerchantLoginRequest:
+      type: object
+      required: [phone, password]
+      properties:
+        phone:
+          type: string
+        password:
+          type: string
+          format: password
+
+    RefreshRequest:
+      type: object
+      required: [refresh_token]
+      properties:
+        refresh_token:
+          type: string
+
+    AuthSession:
+      type: object
+      required: [access_token, refresh_token, expires_at, user]
+      properties:
+        access_token:
+          type: string
+        refresh_token:
+          type: string
+        expires_at:
+          type: string
+          format: date-time
+          description: access token 过期时间
+        user:
+          $ref: '#/components/schemas/User'
+
+    Money:
+      type: integer
+      format: int64
+      description: 金额，单位为「分」
+
+    ProductSummary:
+      type: object
+      required: [id, title, price_cents, status]
+      properties:
+        id:
+          type: string
+          format: uuid
+        title:
+          type: string
+        cover_url:
+          type: string
+        category:
+          type: string
+        price_cents:
+          $ref: '#/components/schemas/Money'
+          description: 展示价（取最低 SKU 价）
+        status:
+          type: string
+          enum: [DRAFT, ON_SALE, OFF_SALE]
+
+    Sku:
+      type: object
+      required: [id, product_id, name, price_cents, stock]
+      properties:
+        id:
+          type: string
+          format: uuid
+        product_id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        price_cents:
+          $ref: '#/components/schemas/Money'
+        stock:
+          type: integer
+
+    ProductDetail:
+      allOf:
+        - $ref: '#/components/schemas/ProductSummary'
+        - type: object
+          required: [description, skus]
+          properties:
+            description:
+              type: string
+            skus:
+              type: array
+              items:
+                $ref: '#/components/schemas/Sku'
+
+    ProductPage:
+      type: object
+      required: [items, total, page, page_size]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/ProductSummary'
+        total:
+          type: integer
+        page:
+          type: integer
+        page_size:
+          type: integer
+
+    CartItem:
+      type: object
+      required: [sku_id, product_id, title, sku_name, unit_price_cents, qty, stock]
+      properties:
+        sku_id:
+          type: string
+          format: uuid
+        product_id:
+          type: string
+          format: uuid
+        title:
+          type: string
+        sku_name:
+          type: string
+        cover_url:
+          type: string
+        unit_price_cents:
+          $ref: '#/components/schemas/Money'
+        qty:
+          type: integer
+        stock:
+          type: integer
+          description: 当前可售库存，供前端禁用加减按钮
+
+    Cart:
+      type: object
+      required: [items, total_cents]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/CartItem'
+        total_cents:
+          $ref: '#/components/schemas/Money'
+
+    PutCartItemRequest:
+      type: object
+      required: [qty]
+      properties:
+        qty:
+          type: integer
+          minimum: 0
+          maximum: 999
+          description: 传 0 等于删除该项
+
+    CreateOrderRequest:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/CreateOrderItem'
+
+    CreateOrderItem:
+      type: object
+      required: [sku_id, qty]
+      properties:
+        sku_id:
+          type: string
+          format: uuid
+        qty:
+          type: integer
+          minimum: 1
+          maximum: 999
+
+    OrderItem:
+      type: object
+      required: [sku_id, title_snapshot, unit_price_cents, qty]
+      properties:
+        sku_id:
+          type: string
+          format: uuid
+        title_snapshot:
+          type: string
+        unit_price_cents:
+          $ref: '#/components/schemas/Money'
+        qty:
+          type: integer
+
+    Order:
+      type: object
+      required: [id, order_no, status, total_cents, expires_at, created_at, items]
+      properties:
+        id:
+          type: string
+          format: uuid
+        order_no:
+          type: string
+        status:
+          $ref: '#/components/schemas/OrderStatus'
+        total_cents:
+          $ref: '#/components/schemas/Money'
+        expires_at:
+          type: string
+          format: date-time
+        paid_at:
+          type: string
+          format: date-time
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/OrderItem'
+
+    OrderPage:
+      type: object
+      required: [items, total, page, page_size]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Order'
+        total:
+          type: integer
+        page:
+          type: integer
+        page_size:
+          type: integer
+
+    PrepayResult:
+      type: object
+      required: [order_id, order_no, provider, amount_cents, params]
+      properties:
+        order_id:
+          type: string
+          format: uuid
+        order_no:
+          type: string
+        provider:
+          type: string
+          enum: [mock, wechat]
+        prepay_id:
+          type: string
+        amount_cents:
+          $ref: '#/components/schemas/Money'
+        params:
+          type: object
+          additionalProperties:
+            type: string
+          description: 客户端调起支付所需的键值对
+
+    MockNotifyRequest:
+      type: object
+      required: [order_no]
+      properties:
+        order_no:
+          type: string
+        amount_cents:
+          $ref: '#/components/schemas/Money'
+
+    MockNotifyResult:
+      type: object
+      required: [handled, order_no, status]
+      properties:
+        handled:
+          type: boolean
+          description: false 表示该回调此前已处理过（幂等命中）
+        order_no:
+          type: string
+        status:
+          $ref: '#/components/schemas/OrderStatus'
+
+security:
+  - bearerAuth: []

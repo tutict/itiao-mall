@@ -1,0 +1,13 @@
+{
+  "extends": "expo/tsconfig.base",
+  "compilerOptions": {
+    "strict": true,
+    // 注意：这里**不能**出现 "baseUrl"。TypeScript 7 已经移除该选项（报 TS5102），
+    // paths 现在一律相对 tsconfig 自身解析 —— 正好也是我们想要的行为。
+    "paths": {
+      "@/*": ["./*"]
+    }
+  },
+  "include": ["**/*.ts", "**/*.tsx", ".expo/types/**/*.ts", "expo-env.d.ts"],
+  "exclude": ["node_modules", "android", "ios", "dist"]
+}

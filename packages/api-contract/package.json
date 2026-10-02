@@ -1,0 +1,16 @@
+{
+  "name": "@itiao/api-contract",
+  "version": "0.1.0",
+  "private": true,
+  "description": "由 docs/openapi/openapi.yaml 生成的 TS 类型。唯一真源是契约，本包内容全部是生成物，不要手改。",
+  "type": "module",
+  "types": "./src/schema.d.ts",
+  "exports": {
+    ".": {
+      "types": "./src/schema.d.ts"
+    }
+  },
+  "files": [
+    "src"
+  ]
+}

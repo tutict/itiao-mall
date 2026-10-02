@@ -1,0 +1,80 @@
+name: itiao-mall-perf
+
+# 压测专用：PG + Redis + API 全部容器化。
+# 本地与将来的 CI 用同一套编排，数字才有可比性。
+services:
+  pg:
+    image: postgres:17-alpine
+    container_name: itiao-perf-pg
+    environment:
+      POSTGRES_USER: itiao
+      POSTGRES_PASSWORD: itiao
+      POSTGRES_DB: itiao
+    ports:
+      - "5432:5432"
+    volumes:
+      - perfpgdata:/var/lib/postgresql/data
+      # 种子 SQL 挂进容器 —— 宿主没有 psql 客户端，必须走容器内执行
+      - ../tools/loadtest/seed:/seed:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U itiao -d itiao"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+      start_period: 10s
+    command:
+      - postgres
+      - -c
+      - max_connections=200
+      - -c
+      - shared_buffers=256MB
+      - -c
+      - synchronous_commit=off
+      - -c
+      - fsync=off
+      - -c
+      - full_page_writes=off
+
+  redis:
+    image: redis:7.4-alpine
+    container_name: itiao-perf-redis
+    command: ["redis-server", "--appendonly", "no", "--save", "", "--maxmemory", "256mb"]
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  api:
+    build:
+      context: ..
+      dockerfile: services/api/Dockerfile
+    container_name: itiao-perf-api
+    depends_on:
+      pg:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      APP_ENV: dev
+      HTTP_ADDR: ":8080"
+      LOG_LEVEL: warn
+      DATABASE_URL: "postgres://itiao:itiao@pg:5432/itiao?sslmode=disable"
+      REDIS_ADDR: "redis:6379"
+      AUTH_PROVIDER: mock
+      PAYMENT_PROVIDER: mock
+      JWT_SECRET: "perf-only-secret"
+      ORDER_PENDING_TTL: 15m
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "/app/api", "healthcheck"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+
+volumes:
+  perfpgdata:

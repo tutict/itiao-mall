@@ -1,0 +1,27 @@
+{
+  "name": "itiao-mall",
+  "version": "0.1.0",
+  "private": true,
+  "description": "商城应用：Expo 用户端 App + Vite 商户端 Web + Go 后端 + k6 性能门禁",
+  "packageManager": "pnpm@12.8.1",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "lint": "biome check .",
+    "lint:fix": "biome check --write .",
+    "format": "biome format --write .",
+    "typecheck": "pnpm -r --if-present run typecheck",
+    "gen": "bash scripts/gen.sh",
+    "infra:up": "docker compose -f deploy/docker-compose.dev.yml up -d",
+    "infra:down": "docker compose -f deploy/docker-compose.dev.yml down",
+    "api:dev": "bash scripts/api.sh",
+    "perf": "bash scripts/perf.sh"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.5.15",
+    "openapi-typescript": "7.13.0",
+    "typescript": "7.0.2",
+    "typescript5": "npm:typescript@5.9.3"
+  }
+}

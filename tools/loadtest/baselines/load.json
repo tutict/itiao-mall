@@ -1,0 +1,31 @@
+{
+  "meta": {
+    "scenario": "load",
+    "createdAt": "2026-10-02T12:28:31.940Z",
+    "runs": 3,
+    "aggregation": "median",
+    "machine": "fhnum2 / Intel(R) Core(TM) Ultra 9 275HX x24 / 31.4GB",
+    "note": "跨机器数字不可比，只与同机基线比较"
+  },
+  "metrics": {
+    "http_req_duration": {
+      "p(95)": 3.0064,
+      "p(99)": 4.0887
+    },
+    "http_reqs": {
+      "rate": 174.1287
+    },
+    "http_req_failed": {
+      "value": 0
+    },
+    "http_req_duration{scenario:browse_read}": {
+      "p(95)": 1.9397
+    },
+    "http_req_duration{scenario:order_write}": {
+      "p(95)": 3.7929
+    },
+    "http_req_duration{scenario:login_write}": {
+      "p(95)": 2.0394
+    }
+  }
+}

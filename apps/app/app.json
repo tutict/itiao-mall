@@ -1,0 +1,25 @@
+{
+  "expo": {
+    "name": "一条商城",
+    "slug": "itiao-mall-app",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "scheme": "itiaomall",
+    "userInterfaceStyle": "automatic",
+    "newArchEnabled": true,
+    "plugins": ["expo-router"],
+    "experiments": {
+      "typedRoutes": true
+    },
+    "web": {
+      "bundler": "metro",
+      "output": "static"
+    },
+    "ios": {
+      "supportsTablet": true
+    },
+    "android": {
+      "package": "com.itiao.mall.app"
+    }
+  }
+}

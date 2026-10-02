@@ -1,0 +1,24 @@
+{
+  "$comment": "TS 7 已移除 baseUrl；paths 改为相对本文件解析。所有 app 通过 extends 继承本文件。",
+  "compilerOptions": {
+    "target": "esnext",
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "moduleDetection": "force",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "verbatimModuleSyntax": true,
+    "isolatedModules": true,
+    "esModuleInterop": true,
+    "resolveJsonModule": true,
+    "skipLibCheck": true,
+    "noEmit": true,
+    "paths": {
+      "@itiao/shared": ["./packages/shared/src/index.ts"],
+      "@itiao/api-contract": ["./packages/api-contract/src/schema.d.ts"],
+      "@itiao/api-client": ["./packages/api-client/src/index.ts"]
+    }
+  }
+}

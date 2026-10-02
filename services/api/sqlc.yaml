@@ -1,0 +1,17 @@
+version: "2"
+sql:
+  - engine: "postgresql"
+    queries: "db/queries"
+    schema: "db/migrations"
+    gen:
+      go:
+        package: "repo"
+        out: "internal/repo"
+        sql_package: "pgx/v5"
+        emit_json_tags: true
+        emit_pointers_for_null_types: true
+        emit_empty_slices: true
+        # uuid 一律映射成 string：全项目把 ID 当字符串用，避免到处 pgtype.UUID <-> string 转换
+        overrides:
+          - db_type: "uuid"
+            go_type: "string"

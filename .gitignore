@@ -1,0 +1,54 @@
+# ---- Node / pnpm ----
+node_modules/
+.pnpm-store/
+.pnpm-debug.log*
+*.tsbuildinfo
+
+# ---- 构建产物 ----
+dist/
+build/
+out/
+
+# ---- Expo / React Native ----
+.expo/
+.expo-shared/
+# 这两个是 `expo prebuild` 由 app.json 生成的原生工程，属于产物而非源码。
+# 本项目用 CNG（Continuous Native Generation），原生目录不进版本库。
+apps/app/android/
+apps/app/ios/
+*.jks
+*.keystore
+*.p8
+*.p12
+*.mobileprovision
+!debug.keystore
+
+# ---- Go ----
+services/api/bin/
+*.exe
+*.test
+*.prof
+
+# ---- 压测产物（基线文件除外）----
+tools/loadtest/results/
+tools/loadtest/k6.log
+k6.log
+results.json
+
+# ---- 环境变量 ----
+.env
+.env.*
+!.env.example
+
+# ---- 日志 ----
+*.log
+npm-debug.log*
+yarn-error.log*
+
+# ---- 编辑器 / 系统 ----
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json

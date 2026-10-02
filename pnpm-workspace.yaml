@@ -1,0 +1,40 @@
+packages:
+  - "apps/*"
+  - "packages/*"
+
+# pnpm 10+ 默认阻止依赖的 postinstall 脚本，下面这些是确有必要执行构建脚本的。
+onlyBuiltDependencies:
+  - "@biomejs/biome"
+  - esbuild
+  - sharp
+  - unrs-resolver
+  - "@swc/core"
+  - bufferutil
+  - utf-8-validate
+
+# ---------------------------------------------------------------------------
+# 关于 TypeScript 7 的编译器 API 缺口（踩坑记录，别再重走）
+#
+# TS 7.0 换成 Go 原生编译器后**不再提供 JS 编译器 API**（`ts.factory.*`，官方排在 7.1 才补）。
+# 任何用编程式 API 建 AST 的工具都会在导入时直接炸：
+#   openapi-typescript → TypeError: Cannot read properties of undefined
+#                        (reading 'createKeywordTypeNode')
+#
+# 根因：openapi-typescript 把 `typescript` 声明成 **peerDependency(^5.x)**，工作区根却是
+# TS 7.0.2；`.npmrc` 里 strict-peer-dependencies=false 让这个不满足的解析静默通过。
+#
+# 已试过、**均无效**（清空 pnpm-lock.yaml 与 node_modules 后重解析验证过）：
+#   1. `overrides: {"openapi-typescript>typescript": "npm:@typescript/typescript6@6"}`
+#      —— npm: 别名不在 pnpm 文档定义的 peer 覆盖语义里，且 TS6 不满足 ^5.x，被静默丢弃。
+#   2. `overrides: {"openapi-typescript>typescript": "5.9.3"}`
+#      —— 文档说 semver range 可覆盖 peer，实测无效（仍是 typescript@7.0.2）。
+#   3. `packageExtensions` 给它加 `dependencies.typescript: 5.9.3`
+#      —— pnpm config get 能读到配置，但 `pnpm peers check` 照样报 unmet peer，未被应用。
+#   结论：在 node-linker=hoisted 下，pnpm 12 的 peer 一律从工作区根解析，这几条设置压不过它。
+#
+# 因此不再依赖包管理器的解析语义，改为在生成脚本里显式处理：
+#   tools/codegen/gen-ts-types.cjs 在 require 之前把 `typescript` 解析劫持到
+#   根依赖中的 npm 别名 `typescript5`（= typescript@5.9.3，只给工具喂 JS 编译器 API），
+#   应用自身的 typescript@7.0.2 完全不受影响。
+# ---------------------------------------------------------------------------
+
