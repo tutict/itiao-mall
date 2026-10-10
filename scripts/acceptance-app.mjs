@@ -14,8 +14,8 @@
 
 import { spawn } from 'node:child_process';
 import { existsSync, readdirSync } from 'node:fs';
-import { mkdir, rm, writeFile } from 'node:fs/promises';
-import { homedir } from 'node:os';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { homedir, tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 
 const args = process.argv.slice(2);
@@ -126,6 +126,7 @@ function record(step, ok, detail) {
 
 let chrome;
 let cdp;
+let profile;
 
 try {
   const exe = findChromium();
@@ -136,8 +137,18 @@ try {
   console.log(`out:      ${OUT}\n`);
 
   await mkdir(OUT, { recursive: true });
-  const profile = join(OUT, '.profile');
-  await rm(profile, { recursive: true, force: true });
+  // 每次跑都用**全新**的 profile 目录，且放在系统临时目录里，不落进 OUT。
+  //
+  // 原来固定用 OUT/.profile 并在启动前 rm -r 掉它。两个问题：
+  //
+  //   1. 跑过几轮之后那目录里有 190+ 个文件，启动时的批量删除会被本机沙箱的
+  //      删除守卫直接拦下（SAFE_DELETE_BULK_CONFIRM_REQUIRED）。它抛在任何一步
+  //      之前，于是整个验收以"执行中断"收场 —— 报告上写成一条失败，看起来像
+  //      验收/App 出了问题，实际连浏览器都还没起。
+  //   2. 复用同一个目录本身就是 flakiness 来源：上一轮残留的 cookie 与
+  //      localStorage 会让"登录页渲染"这类断言时绿时红。
+  // 换成一次性目录后两件事同时消失：没有旧目录要删，也不存在残留状态。
+  profile = await mkdtemp(join(tmpdir(), 'itiao-accept-'));
 
   chrome = spawn(
     exe,
@@ -439,4 +450,10 @@ try {
   await writeFile(reportFile, JSON.stringify(report, null, 2));
   const passed = report.steps.filter((s) => s.ok).length;
   console.log(`\n=== ${passed}/${report.steps.length} 通过，报告：${reportFile} ===`);
+
+  // 一次性 profile 目录，顺手清掉。两处刻意为之：
+  //   - 放在**报告写完之后**：这个 rm 同样可能撞上批量删除守卫，若它抛在前面，
+  //     报告就写不出来了 —— 一次成功的验收会变成"没有证据"。
+  //   - 失败一律吞掉：它只是个浏览器缓存，删不掉也不影响本次结论。
+  if (profile) await rm(profile, { recursive: true, force: true }).catch(() => {});
 }

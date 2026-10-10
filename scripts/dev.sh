@@ -7,8 +7,15 @@ export PATH="/c/Users/tutic/.workbuddy/binaries/PortableGit/versions/1.2.0/usr/b
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
+# compose 文件列表统一由 lib 解析 —— 个人端口覆盖必须能生效。
+# 细节见 scripts/lib/dev-compose.sh 顶部：显式 -f 会让 Compose 丢掉个人覆盖，
+# 进而按仓库映射重建容器，把本机改过的宿主端口清掉。
+# shellcheck source=scripts/lib/dev-compose.sh
+. "$ROOT/scripts/lib/dev-compose.sh"
+
 echo "== 启动 PG + Redis =="
-docker compose -f deploy/docker-compose.dev.yml up -d
+resolve_dev_compose || exit 1
+docker compose "${DEV_COMPOSE_ARGS[@]}" up -d
 
 echo "== 等待健康 =="
 for i in $(seq 1 40); do

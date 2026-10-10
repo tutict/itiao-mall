@@ -67,6 +67,16 @@ services:
       PAYMENT_PROVIDER: mock
       JWT_SECRET: "perf-only-secret"
       ORDER_PENDING_TTL: 15m
+      # 压测专用阈值：把限流放宽到远超负载量级。
+      #
+      # load.js 的 browse() 是匿名的 → 全部读请求共用一个 IP 桶，需要约 8000 次读/分钟，
+      # 而默认是 120 次/分钟（RATE_LIMIT_MAX）。按默认值跑，≈98% 的请求会吃 429，
+      # http_req_failed 冲到 95%，测出来的是限流器而不是应用。
+      #
+      # 放宽而不是关掉（RATE_LIMIT_ENABLED: "false"）：关掉会让限流中间件整条跳过，
+      # 等于把被测路径摘掉一段；给个大阈值时限流照常执行（Lua 照跑），只是不触发 429。
+      RATE_LIMIT_MAX: "1000000"
+      RATE_LIMIT_AUTH_MAX: "1000000"
     ports:
       - "8080:8080"
     healthcheck:

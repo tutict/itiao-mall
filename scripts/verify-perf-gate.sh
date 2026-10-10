@@ -62,7 +62,18 @@ fi
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-PROBE_PORT="${PROBE_PORT:-8081}"
+# 劣化版 API 的监听端口。
+#
+# **刻意不是 8081**：8081 是 scripts/preview-web.mjs 与 scripts/acceptance-app.mjs
+# 的默认端口（App 的 web 预览），而门禁的最后一项正需要它跑着 web 预览。
+# 两边都用 8081 时的实际表现是：本脚本的 start_probe 先 kill_port 8081 把预览干掉、
+# 再把劣化版 API 绑上去，验收随后连不上预览而红 —— 甚至更早，这里会因端口被占
+# 而一直等不到 /healthz 就超时。结果是门禁**永远不可能端到端全绿**，而红的那一项
+# 看起来像"验收/性能门禁挂了"，根因却只是一个端口号。
+#
+# 记一笔：这个冲突在把三项新检查加进门禁时没被发现，因为当时只跑了单项。
+# 加步骤时要问的不只是"它自己能不能过"，还有"它跟别的步骤抢不抢同一种资源"。
+PROBE_PORT="${PROBE_PORT:-8091}"
 PROBE_DELAY="${PROBE_DELAY:-25*time.Millisecond}"
 PROBE_MIN_MS="${PROBE_MIN_MS:-10}"
 LOGDIR="tools/loadtest/results"
@@ -166,11 +177,33 @@ build() {
 
 start_probe() {
   kill_port "$PROBE_PORT"
+  # DATABASE_URL / REDIS_ADDR 优先取**继承来的**环境变量，只在没设时才回落到默认值。
+  #
+  # 原来两者都写死。写死的后果不是"报错说连不上库"，而是更坏的一种：
+  # 劣化版的注入跑与恢复跑**都**因为没有库而失败 —— 于是"恢复后门禁必须转绿"
+  # 这一步红掉，脚本报"门禁无效或流程出错"，而真正的原因是一个端口号。
+  # 本机的 PG 因 Windows 保留端口段映射在 15432，就是踩在这上面。
+  #
+  # 继承而不是自己解析：门禁（check-all.sh）本来就是带着 DATABASE_URL 调进来的，
+  # 让它传下去，比在这里再猜一遍环境更可靠。
+  #
+  # RATE_LIMIT_MAX / RATE_LIMIT_AUTH_MAX 是**压测专用**的高阈值，理由：
+  #
+  #   load.js 的 browse() 是匿名的（不带 token），所以全部读请求共用一个 IP 桶；
+  #   而它需要约 8000 次读/分钟，默认阈值是 120 次/分钟 —— 于是 ≈98% 的请求吃 429，
+  #   `http_req_failed` 冲到 95%，三路场景全红。**那测的是限流器，不是应用。**
+  #   更关键的是这会让本次数字与基线不可比：baselines/load.json 记录于限流上线之前
+  #   （http_req_failed=0），不把限流放宽就永远对不上。
+  #
+  # 为什么是"放宽"而不是"关掉"：RATE_LIMIT_ENABLED 一旦为 false，限流中间件整条
+  # 跳过 —— 那等于把被测路径摘掉一段。给一个够大的阈值则限流照常执行（Lua 照跑、
+  # 每条请求都过一遍），只是不在这个量级上触发 429。
   (
     cd services/api
     APP_ENV=dev HTTP_ADDR=":${PROBE_PORT}" LOG_LEVEL=warn \
-    DATABASE_URL="postgres://itiao:itiao@localhost:5432/itiao?sslmode=disable" \
-    REDIS_ADDR=localhost:6379 AUTH_PROVIDER=mock PAYMENT_PROVIDER=mock \
+    DATABASE_URL="${DATABASE_URL:-postgres://itiao:itiao@localhost:5432/itiao?sslmode=disable}" \
+    REDIS_ADDR="${REDIS_ADDR:-localhost:6379}" AUTH_PROVIDER=mock PAYMENT_PROVIDER=mock \
+    RATE_LIMIT_MAX="${RATE_LIMIT_MAX:-1000000}" RATE_LIMIT_AUTH_MAX="${RATE_LIMIT_AUTH_MAX:-1000000}" \
     JWT_SECRET=dev-only-secret-please-change \
     nohup "./bin/$1" serve >"../../$LOGDIR/probe-api.log" 2>&1 &
     disown || true
