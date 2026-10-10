@@ -349,7 +349,7 @@ cd services/api && go mod edit -go=1.26.1
 | `go test` 退出码 0、报 PASS | 看起来"限流全绿" |
 | 实际 **10/13** 个限流测试没执行 | 滑动窗口、Lua 原子性、并发判定、降级方向 —— **核心逻辑一条都没验证过** |
 | `httpapi` 的 `TestRateLimitGate_Returns429WithHeaders` 也跳过 | 它是唯一断言"429 带 `Retry-After` 与 `X-RateLimit-*`、detail 不泄露内部结构"的用例 |
-| `check-all.sh` 的 `MIN_GO_TESTS` 下限 | 只数 PASS 条数，数不出被 skip 掉的那些 |
+| `check-all.sh` 的 `MIN_GO_TESTS` 下限 | 只数 PASS 条数，数不出被 skip 掉的那些（**此限制已于 2026-10-10 修掉**：门禁现在把 `SKIP > 0` 直接判失败，见 `docs/security-plan.md`） |
 
 这是项目铁律「**`t.Skip` 与真通过在退出码上无法区分**」的第三次重演 —— 而这次丢掉的恰好是
 **限流器本身**。更坏的是它污染了变异验证：施加变异后"测试仍全绿"，被记成"守卫是假的"，
