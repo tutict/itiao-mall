@@ -1,7 +1,7 @@
 {
   "meta": {
     "scenario": "load",
-    "createdAt": "2026-10-02T13:32:18.796Z",
+    "createdAt": "2026-10-10T09:40:34.172Z",
     "runs": 3,
     "aggregation": "median",
     "machine": "fhnum2 / Intel(R) Core(TM) Ultra 9 275HX x24 / 31.4GB",
@@ -9,23 +9,23 @@
   },
   "metrics": {
     "http_req_duration": {
-      "p(95)": 2.846,
-      "p(99)": 3.3227
+      "p(95)": 3.5726,
+      "p(99)": 6.1147
     },
     "http_reqs": {
-      "rate": 174.1174
+      "rate": 173.7298
     },
     "http_req_failed": {
       "value": 0
     },
     "http_req_duration{scenario:browse_read}": {
-      "p(95)": 1.696
+      "p(95)": 3.0583
     },
     "http_req_duration{scenario:order_write}": {
-      "p(95)": 3.255
+      "p(95)": 4.5125
     },
     "http_req_duration{scenario:login_write}": {
-      "p(95)": 1.8199
+      "p(95)": 3.4921
     }
   }
 }
