@@ -23,23 +23,15 @@ import (
 
 // newTokenTestService 建一个同时连真实 PG 与 Redis 的 Service。
 // refresh 轮换这条路两头都要用，所以两个都必须真。
+//
+// Redis 侧默认走 miniredis（见 newRedisForTest 的注释）—— 原来"连不上就 Skip"
+// 会让下面十几条 refresh 用例在无 Redis 的机器上静默通过，而它们正是
+// 这套设计里最承重的部分。PG 侧没有替代品，仍依赖 DATABASE_URL。
 func newTokenTestService(t *testing.T) (*service.Service, *pgxpool.Pool) {
 	t.Helper()
 
 	pool := newTestPool(t)
-
-	addr := os.Getenv("REDIS_ADDR")
-	if addr == "" {
-		addr = "localhost:6379"
-	}
-	rdb := redis.NewClient(&redis.Options{Addr: addr})
-	t.Cleanup(func() { _ = rdb.Close() })
-
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	if err := rdb.Ping(ctx).Err(); err != nil {
-		t.Skipf("连不上 Redis(%s)，跳过：%v", addr, err)
-	}
+	rdb := newRedisForTest(t)
 
 	svc := service.New(service.Deps{
 		Q:            repo.New(pool),

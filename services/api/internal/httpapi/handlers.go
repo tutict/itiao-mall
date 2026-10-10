@@ -592,7 +592,7 @@ func (h *Handler) MockPayNotify(ctx context.Context, req gen.MockPayNotifyReques
 	}
 	body, err := json.Marshal(map[string]any{
 		"order_no":     req.Body.OrderNo,
-		"amount_cents": derefInt64(req.Body.AmountCents),
+		"amount_cents": int64(req.Body.AmountCents),
 	})
 	if err != nil {
 		// 原文只进日志：不拼进返回的 error，否则 json.Marshal 的错误会带着

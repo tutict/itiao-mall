@@ -24,12 +24,22 @@ import (
 )
 
 // newTestPool 打开一个连到 DATABASE_URL 的连接池；未配置则跳过用例。
+//
+// ★ 这是全库**唯一**一处允许保留的 t.Skip。
+//
+// 为什么它不能像 Redis 那几处一样改成默认进程内替身：Postgres 没有 miniredis
+// 那样的等价物 —— 这些用例验的正是行锁、唯一约束、条件更新这些**数据库本身的语义**，
+// 用假实现替代等于把要验的东西换成自己的假设。
+//
+// 但"允许 skip"不等于"允许静默"。兜底在 check-all.sh：它在 DATABASE_URL 未设时
+// 会**直接失败**（而不是让测试 skip 后仍报绿），并断言 PASS 条数下限 ——
+// 少了 100 多条的绿灯没有意义。
 func newTestPool(t *testing.T) *pgxpool.Pool {
 	t.Helper()
 
 	dsn := os.Getenv("DATABASE_URL")
 	if dsn == "" {
-		t.Skip("未设置 DATABASE_URL，跳过需要数据库的集成测试")
+		t.Skip("未设置 DATABASE_URL，跳过需要数据库的集成测试（check-all.sh 会在这种情况下直接判定失败）")
 	}
 
 	pool, err := postgres.New(context.Background(), dsn)
@@ -302,5 +312,129 @@ func TestHandleNotify_DuplicateCallbackIsIdempotent(t *testing.T) {
 	}
 	if eventCount != 1 {
 		t.Errorf("同一笔回调落了 %d 条支付事件，期望 1 条", eventCount)
+	}
+}
+
+// ★ 资损面核心守卫：回调金额必须与订单应付金额一致。
+//
+// 回调报文里的金额是对端"说的"，不是事实。取信它的话，任何人发一个
+// amount_cents=1 的回调就能把整单标记为已支付（实测过 total_cents=2274 → PAID）。
+//
+// 表驱动覆盖三种不符形态，每个子用例断言三条互相独立的后果：
+// 返回 ErrPaymentAmountMismatch、订单保持待支付、payment_events 不留痕迹。
+// 第三条最关键 —— 留了痕迹就会占用唯一键，把同一笔交易的真回调吞掉。
+func TestHandleNotify_RejectsAmountMismatch(t *testing.T) {
+	svc, pool := newTestService(t)
+	skuID, userID := seedStockFixture(t, pool, 100)
+
+	view, err := svc.CreateOrder(context.Background(), userID, "", []service.OrderLineInput{
+		{SkuID: skuID, Qty: 2}, // 2 × 1234
+	})
+	if err != nil {
+		t.Fatalf("下单失败: %v", err)
+	}
+	orderNo := view.Order.OrderNo
+	want := view.Order.TotalCents
+	if want <= 0 {
+		t.Fatalf("订单金额异常: %d", want)
+	}
+
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_, _ = pool.Exec(ctx, `DELETE FROM payment_events WHERE out_trade_no = $1`, orderNo)
+	})
+
+	cases := []struct {
+		name   string
+		amount int64
+	}{
+		{"少付一分", want - 1},
+		{"金额为零", 0},
+		{"金额为负", -1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			body := []byte(fmt.Sprintf(`{"order_no":%q,"amount_cents":%d}`, orderNo, tc.amount))
+			_, err := svc.HandleNotify(context.Background(), body, nil)
+			if err == nil {
+				t.Fatalf("金额 %d（应付 %d）的回调被接受 —— 可用 1 分钱买走整单", tc.amount, want)
+			}
+			if !errors.Is(err, domain.ErrPaymentAmountMismatch) {
+				t.Fatalf("期望 ErrPaymentAmountMismatch，实际: %v", err)
+			}
+
+			var status string
+			if qerr := pool.QueryRow(context.Background(),
+				`SELECT status FROM orders WHERE order_no = $1`, orderNo).Scan(&status); qerr != nil {
+				t.Fatalf("查询订单状态失败: %v", qerr)
+			}
+			if status != string(domain.OrderPendingPayment) {
+				t.Errorf("被拒后订单状态 = %s，期望 PENDING_PAYMENT", status)
+			}
+
+			var events int
+			if qerr := pool.QueryRow(context.Background(),
+				`SELECT count(*) FROM payment_events WHERE out_trade_no = $1`, orderNo).Scan(&events); qerr != nil {
+				t.Fatalf("统计支付事件失败: %v", qerr)
+			}
+			if events != 0 {
+				t.Errorf("金额不符却落了 %d 条支付事件 —— 真回调会被幂等吞掉，用户付了钱订单永远待支付", events)
+			}
+		})
+	}
+}
+
+// 金额相符必须放行 —— 上一条的对照，防止把条件写成恒假（一律拒绝）。
+//
+// 刻意**先发一次错误金额、再发正确金额**：mock 的 transaction_id 由 order_no 派生
+// （见 payment/mock.go），两次完全相同。这样一条用例钉住两件事：
+//   - 金额核对被删掉时（变异体 M39），错误金额会被接受、订单直接变成 PAID，
+//     随后那条"正确金额"的回调只会命中幂等分支（handled=false）—— 两处断言都会红；
+//   - 被拒的回调没在库里留下任何妨碍正确回调的东西。
+//
+// 诚实说明：第二点**不是**在验"插入写在核对之前会占住唯一键"。整段跑在一个事务里，
+// 拒绝路径会 Rollback，占坑根本不会持久化（那种写法得先把插入挪出事务才成问题）。
+// 这条测试抓的是"核对被删/被绕过"，不是"插入顺序写反"。
+func TestHandleNotify_AmountEqualSucceeds(t *testing.T) {
+	svc, pool := newTestService(t)
+	skuID, userID := seedStockFixture(t, pool, 100)
+
+	view, err := svc.CreateOrder(context.Background(), userID, "", []service.OrderLineInput{
+		{SkuID: skuID, Qty: 1},
+	})
+	if err != nil {
+		t.Fatalf("下单失败: %v", err)
+	}
+	orderNo := view.Order.OrderNo
+	want := view.Order.TotalCents
+
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_, _ = pool.Exec(ctx, `DELETE FROM payment_events WHERE out_trade_no = $1`, orderNo)
+	})
+
+	badBody := []byte(fmt.Sprintf(`{"order_no":%q,"amount_cents":%d}`, orderNo, want-1))
+	if _, err := svc.HandleNotify(context.Background(), badBody, nil); err == nil {
+		t.Fatal("金额不符的回调应被拒绝")
+	}
+
+	goodBody := []byte(fmt.Sprintf(`{"order_no":%q,"amount_cents":%d}`, orderNo, want))
+	res, err := svc.HandleNotify(context.Background(), goodBody, nil)
+	if err != nil {
+		t.Fatalf("金额相符的回调应被接受，实际报错: %v", err)
+	}
+	if !res.Handled || res.Status != string(domain.OrderPaid) {
+		t.Fatalf("金额相符后订单应为 PAID，实际 handled=%v status=%s", res.Handled, res.Status)
+	}
+
+	var events int
+	if qerr := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM payment_events WHERE out_trade_no = $1`, orderNo).Scan(&events); qerr != nil {
+		t.Fatalf("统计支付事件失败: %v", qerr)
+	}
+	if events != 1 {
+		t.Errorf("支付事件数 = %d，期望 1（错误回调不该占坑，正确回调该落 1 条）", events)
 	}
 }

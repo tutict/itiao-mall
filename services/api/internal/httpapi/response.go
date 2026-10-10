@@ -102,6 +102,10 @@ func mapError(err error) (int, string) {
 		return http.StatusConflict, "资源冲突"
 	case errors.Is(err, domain.ErrInvalidTransition), errors.Is(err, domain.ErrPaymentNotPending):
 		return http.StatusConflict, "状态不允许该操作"
+	case errors.Is(err, domain.ErrPaymentAmountMismatch):
+		// 400 而不是 500：这是对端报文的问题（金额对不上），不是我们坏了。
+		// 回 500 会让支付平台按"我们暂时故障"的逻辑反复重投同一笔错误回调。
+		return http.StatusBadRequest, "支付金额与订单不符"
 	case errors.Is(err, domain.ErrIdempotentHit):
 		return http.StatusOK, "幂等命中"
 	case errors.Is(err, auth.ErrRefreshReused):

@@ -371,8 +371,12 @@ MUTATIONS: list[Mutation] = [
     Mutation(
         ident="M18 限流专用客户端的 ReadTimeout 不再跟随判定超时",
         rel_path="services/api/internal/ratelimit/ratelimit.go",
-        old="\t\tDialTimeout:  timeout,\n\t\tReadTimeout:  timeout,\n\t\tWriteTimeout: timeout,",
-        new="\t\tDialTimeout:  5 * time.Second,\n\t\tReadTimeout:  5 * time.Second,\n\t\tWriteTimeout: 5 * time.Second,\n\t\t_ = timeout,",
+        # 只改 ReadTimeout 这一行。**不要**顺手把 DialTimeout / WriteTimeout 一起改，
+        # 也不要往 struct 字面量里塞 `_ = timeout` —— 那会变成语法错误，
+        # 于是"测试红了"但红的是编译失败，证明的是「文件坏了」而不是「守卫有牙」。
+        # 这个坑实测踩过一次（第一次跑出来就是「只有包级失败，没有具名测试」）。
+        old="\t\tReadTimeout:  timeout,",
+        new="\t\tReadTimeout:  5 * time.Second,",
         expect_fail=["TestAllow_HasItsOwnTimeout"],
         why="go-redis 的 ctx deadline 拦不住阻塞中的 socket 读 —— 实测 200ms 的 ctx "
         "实际耗 5.0009s，等的是客户端自己的 ReadTimeout。把它写死成 5s 之后，"
@@ -380,22 +384,31 @@ MUTATIONS: list[Mutation] = [
         "准入控制反而成了全站最大的一笔延迟",
         note="锚点必须在测试**真正读到**的代码上。最初这条变异改的是 "
         "cmd/api/main.go（把专用客户端换成共用的 rdb）—— 而 main.go 不被任何 "
-        "Go 测试覆盖，那样的变异体恒为『未证明』，是典型的假验证。\n"
-        "另注：`_ = timeout` 必须在 struct 字面量**外面**。写进字面量里会变成"
-        "`_ = timeout: 5*time.Second` 这类语法错误 —— 那证明的是「文件坏了」，"
-        "不是「守卫有牙」（这个坑实测踩过一次）。",
+        "Go 测试覆盖，那样的变异体恒为『未证明』，是典型的假验证。",
     ),
     Mutation(
-        ident="M19 限流后端地址随错误外泄",
+        ident="M19 丢掉 ErrBackendUnavailable 哨兵（fail-closed 静默退化为 fail-open）",
         rel_path="services/api/internal/ratelimit/ratelimit.go",
-        old='return Result{}, fmt.Errorf("%w: %v", ErrBackendUnavailable, err)',
+        # 锚点在 2026-10-10 的 P2-6 加固后从 `fmt.Errorf("%w: %v", ...)` 换成
+        # `&BackendError{Cause: err}`（原文不再拼进 Error()）。变异语义不变：
+        # 都是"让 errors.Is(err, ErrBackendUnavailable) 不成立"。
+        old="return Result{}, &BackendError{Cause: err}",
         new="return Result{}, fmt.Errorf(\"限流后端异常: %v\", err)",
-        expect_fail=["TestAllow_DoesNotLeakBackendAddress"],
-        why="错误原文形如 dial tcp 10.0.3.11:6379，含内网地址与拓扑 —— "
-        "外泄等于给攻击者画地图",
-        note="这一条同时拆掉了哨兵错误包装，于是 errors.Is 判定失效。"
-        "所以它会连带让 fail-closed 失效 —— 两个后果都是真回归，"
-        "两个守卫都该报红",
+        # 注意期望的测试换了：原来写的是 TestAllow_DoesNotLeakBackendAddress，
+        # 但那条守卫**抓不住**这个变异 —— 新错误里依然用 %v 带了原始错误，
+        # 泄露程度与改之前一样（都取决于 dial 失败的形态）。
+        # 真正有牙的是哨兵判定：拆掉 %w 之后 Decide 里的 errors.Is 恒为 false，
+        # 于是 fail-closed 分支不成立，代码落到下面那条"放行"分支 ——
+        # **配置为收紧的限流器在 Redis 故障时静默变成放行**。
+        expect_fail=["TestDecide_BackendDown", "TestRateLimitGate_BackendDownFailsClosedAs503"],
+        why="这是最坏的一种失效形态：Redis 一挂，准入控制不是报错而是**消失**。"
+        "攻击者只需打掉 Redis（或等它自己抖一下），撞库与刷单在这段时间内不受任何限制，"
+        "而监控上看到的只是若干条 503/降级日志 —— 与「限流正常工作」难以区分",
+        note="原始版本声称的危害是「后端地址随错误外泄」。实测不成立："
+        "Decide 的错误只在 fail-closed 分支返回，而中间件**只记日志、不回响应体**，"
+        "所以内网地址到不了客户端。"
+        "（那时还留着一处注释与实现不符：注释说「不把 err 原样上抛」，实现却用了 "
+        "`%w: %v` —— 已在 2026-10-10 的 P2-6 用 BackendError 修掉，由 M41 守着。）",
     ),
 
     # ---- refresh 轮换原子性（2026-10-03）----
@@ -404,11 +417,18 @@ MUTATIONS: list[Mutation] = [
         rel_path="services/api/internal/repo/refresh_tokens.sql.go",
         old="WHERE token_hash = $1\n  AND status = 'ACTIVE'\n  AND expires_at > now()",
         new="WHERE token_hash = $1\n  AND expires_at > now()",
-        expect_fail=["TestRefresh_ConcurrentOnlyOneSucceeds"],
+        expect_fail=[
+            "TestConsumeRefreshToken_SQLGuards",
+            "TestRefresh_DBGuard_ConcurrentOnlyOneSucceedsWithoutRedis",
+        ],
         why="这是整套 refresh 设计的权威裁决点。去掉 status 条件后，"
         "两个并发刷新都能把同一条标成 ROTATED，签出两批有效新 token —— "
         "用户在 App 里遇到「刚刷新成功，下一次刷新又说令牌无效」",
-        note="改的是 sqlc 生成文件里的 SQL 文本：这里要验的是 SQL 语义，"
+        note="原先期望的 TestRefresh_ConcurrentOnlyOneSucceeds 抓不住它 —— 那条走的是"
+        "Redis 的原子消费，并发在 Lua 那层就被挡下了，CAS 的 status 条件从没被执行到。"
+        "补了两条：一条直接调 repo 验 SQL 语义（过期要拒/未过期要放/已消费要拒），"
+        "一条把 Redis 换成不可达地址、只剩 DB 兜底时跑 20 并发。"
+        "改的是 sqlc 生成文件里的 SQL 文本：这里要验的是 SQL 语义，"
         "不是生成器本身，所以不必为变异跑一次 codegen",
     ),
     Mutation(
@@ -416,39 +436,60 @@ MUTATIONS: list[Mutation] = [
         rel_path="services/api/internal/repo/refresh_tokens.sql.go",
         old="WHERE token_hash = $1\n  AND status = 'ACTIVE'\n  AND expires_at > now()",
         new="WHERE token_hash = $1\n  AND status = 'ACTIVE'",
-        expect_fail=["TestRefresh_ExpiredTokenRejectedWithoutFamilyRevoke"],
+        expect_fail=[
+            "TestConsumeRefreshToken_SQLGuards",
+            "TestRefresh_CompensatesWhenDBCasFails",
+        ],
         why="过期令牌仍能换到新的 access token，等于令牌有效期形同虚设",
+        note="同样换过期望的测试。TestRefresh_ExpiredTokenRejectedWithoutFamilyRevoke "
+        "抓不住它：service 的过期预检排在 CAS 之前，过期行在那里就被拒了，"
+        "SQL 里的 expires_at 条件永远不会被执行。所以补了一条直接调 repo 的测试，"
+        "以及一条用回拨时钟骗过预检、把请求逼到 CAS 上的测试。",
     ),
     Mutation(
         ident="M22 库里改存 refresh token 明文",
         rel_path="services/api/internal/service/token.go",
-        old="\t\t\tTokenHash: hash,\n\t\t\tRole:      user.Role,\n\t\t\tExpiresAt: pgtypeTimestamptz(time.Now().Add(s.RefreshTTL)),\n\t\t}); err != nil {\n\t\t\treturn fmt.Errorf(\"写入 refresh 记录失败: %w\", err)",
-        new="\t\t\tTokenHash: refreshToken,\n\t\t\tRole:      user.Role,\n\t\t\tExpiresAt: pgtypeTimestamptz(time.Now().Add(s.RefreshTTL)),\n\t\t}); err != nil {\n\t\t\treturn fmt.Errorf(\"写入 refresh 记录失败: %w\", err)",
+        # 锚点选在 `hash` 的**声明**处，而不是它的使用处（`TokenHash: hash,`）。
+        #
+        # 为什么要这样选：只把使用处改成 `TokenHash: refreshToken,` 的话，
+        # `hash := auth.HashToken(refreshToken)` 就再没人用了 ——
+        # Go 对未使用的局部变量是**编译错误**，于是整个包编不过。
+        # 那会让判定退化成"包级失败"，证明的是「文件坏了」而不是「守卫有牙」。
+        # 把声明直接改成 `hash := refreshToken`，编译照常通过、库里落的也是明文，
+        # 这才是这个变异体想表达的那个缺陷。
+        old="\tfamilyID := auth.NewFamilyID()\n\thash := auth.HashToken(refreshToken)",
+        new="\tfamilyID := auth.NewFamilyID()\n\thash := refreshToken",
         expect_fail=["TestRefresh_DatabaseStoresHashNotPlaintext"],
         why="refresh token 是持有即等同凭证的东西。库被读走（备份泄露、注入读表、"
         "日志里有人打了 select *）时，存明文等于所有在线用户的会话同时失窃",
-        note="锚点必须带上 `hash` 变量的**全部使用点**。只改 "
-        "`TokenHash: hash,` 这一行的话，hash 变成 declared and not used，"
-        "整个包编译不过 —— 退出码确实非 0，但那是「文件坏了」不是「守卫有牙」",
+        note="`hash` 这个声明在 token.go 里出现两次（Refresh 与 issueSession），"
+        "所以要带上上一行 familyID 做区分，否则锚点命中 2 次、变异无法施加。",
     ),
     Mutation(
         ident="M23 Redis 消费成功但 DB CAS 失败时不回滚",
         rel_path="services/api/internal/service/token.go",
         old="if redisConsumed {\n\t\t\tif rerr := s.RefreshStore.Compensate(",
         new="if false {\n\t\t\tif rerr := s.RefreshStore.Compensate(",
-        expect_fail=["TestRefresh_ConcurrentOnlyOneSucceeds"],
+        expect_fail=["TestRefresh_CompensatesWhenDBCasFails"],
         why="不回滚会留下一条「库里查无此会话、却能换到 access token」的凭证 —— "
         "它能换到 token（签发不查库），于是出现最难查的一类不一致",
+        note="原先期望的 TestRefresh_ConcurrentOnlyOneSucceeds 抓不住它：并发下失败的那些"
+        "在 Redis Lua 层就被判成重放，根本走不到「Redis 成功 + DB 失败」这个组合。"
+        "补的测试用回拨时钟骗过过期预检，把请求逼到 CAS 失败的那一刻 —— "
+        "那是 Compensate 唯一被需要的场景。",
     ),
     Mutation(
         ident="M24 刷新时不先查权威侧（只信 Redis）",
         rel_path="services/api/internal/service/token.go",
         old='\tif err != nil {\n\t\tif errors.Is(err, pgx.ErrNoRows) {\n\t\t\t// 库里都没有',
         new='\tif err != nil {\n\t\tif true {\n\t\t\t// 库里都没有',
-        expect_fail=["TestRefresh_DatabaseOverridesRedisGhost", "TestRefresh_RejectsUnknownToken"],
-        why="Redis 说了不算，库说了才算。删掉 ErrNoRows 分支后，"
-        "库里不存在的 token 也会被放行 —— 一条「缓存里有、库里没有」的幽灵记录"
-        "就能换到 access token",
+        expect_fail=["TestRefresh_PropagatesNonRowError"],
+        why="Redis 说了不算，库说了才算。删掉 ErrNoRows 判断后，"
+        "数据库查询故障会被当成「令牌不存在」—— 真实故障被伪装成用户凭证问题，"
+        "监控上表现成「一堆用户拿着无效令牌」，运维会去查客户端而不是查数据库",
+        note="原先期望的两条（DatabaseOverridesRedisGhost / RejectsUnknownToken）抓不住："
+        "它们只覆盖 ErrNoRows 这一种错误，两种实现下都返回「无效」，所以全绿。"
+        "补的测试用一个总是失败的假 DBTX 注入非 ErrNoRows 错误。",
     ),
 
     # ---- 商品管理（task 13）----
@@ -611,6 +652,112 @@ MUTATIONS: list[Mutation] = [
         "永远加载失败的图。商户在真机上看到白框，然后回来问「为什么图片不显示」——"
         "这类问题的排查成本远高于在这里挡一下",
     ),
+
+    # ---- 安全加固第二轮：支付语义（2026-10-10）----
+    Mutation(
+        ident="M39 支付回调不再核对金额",
+        rel_path="services/api/internal/service/commerce.go",
+        old="if ev.AmountCents <= 0 || ev.AmountCents != order.TotalCents {",
+        new="if false {",
+        expect_fail=[
+            "TestHandleNotify_RejectsAmountMismatch",
+            "TestHandleNotify_AmountEqualSucceeds",
+        ],
+        why="回调金额是对端「说的」，不是事实。不核对等于把定价权交给能构造请求的人 —— "
+        "实测可以用 amount_cents=1 把 total_cents=2274 的订单标记为已支付（约 0.04 折买走整单）",
+        note="两条测试都会被抓住，而且方向互补：RejectsAmountMismatch 证明「不符要拒」，"
+        "AmountEqualSucceeds 证明「相符要放行」。只有前者的守卫可以被「一律拒绝」这种"
+        "写坏的实现骗过 —— 而那会把正常支付全部挡在门外。",
+    ),
+    Mutation(
+        ident="M40 /readyz 回依赖错误原文（内网地址外泄）",
+        rel_path="services/api/internal/httpapi/router.go",
+        old='\t\t\tchecks["pg"] = "unavailable"',
+        new='\t\t\tchecks["pg"] = err.Error()',
+        expect_fail=["TestReadyz_DoesNotLeakDependencyError"],
+        why="/readyz 是公开路由，任何能发请求的人都读得到。err.Error() 里带着内网主机名"
+        "与端口，pgx 还会带 host=/user=/database= —— 实测过 dial tcp [::1]:6379 "
+        "直接出现在响应体里。这等于送一份内网拓扑图",
+        note="只改 pg 一侧就够：redis 一侧写法完全对称，而一条变异只能有一个锚点。",
+    ),
+    Mutation(
+        ident="M42 X-Request-ID 原样采信（日志注入 / 关联伪造面）",
+        rel_path="services/api/internal/httpapi/middleware.go",
+        old="if !requestIDPattern.MatchString(id) {",
+        new='if id == "" {',
+        expect_fail=["TestRequestID_RejectsUntrustedValues"],
+        why="这个值会写进响应头与全部日志。采信任意值等于把日志内容与关联 id 的控制权"
+        "交给调用方：超长串撑爆日志行，特殊字符可伪造跨系统关联",
+        note="这是修复前的原始实现。正向断言（合规值必须保留）在两种实现下都成立，"
+        "所以只有 RejectsUntrustedValues 对它变红 —— 那正是它存在的意义。",
+    ),
+    Mutation(
+        ident="M41 后端错误原文重新拼进 Error()（地址随任何误用点外泄）",
+        rel_path="services/api/internal/ratelimit/ratelimit.go",
+        old="return Result{}, &BackendError{Cause: err}",
+        new="return Result{}, fmt.Errorf(\"%w: %v\", ErrBackendUnavailable, err)",
+        expect_fail=["TestAllow_DoesNotLeakBackendAddress"],
+        why="这正是加固前的形态：注释承诺「不把 err 原样上抛」，实现却把 Redis 原文"
+        "（dial tcp 10.0.3.11:6379 ...）拼进了 Error()。当前它到不了客户端，"
+        "但下一个把 Allow 的错误直接写进响应体的人会把它带出去 —— 而注释会让他以为安全",
+        note="与 M19 共用同一个锚点（`&BackendError{Cause: err}`），但变异方向相反："
+        "M19 让哨兵消失（fail-open），M41 让原文出现（泄露）。两条都要有 —— "
+        "只防一种形态的守卫，在另一种写错方式面前会全绿。",
+    ),
+
+    # ---- 封面地址主机名判定（P3-9，2026-10-10 第三批）----
+    #
+    # 这一组三条都在同一个函数上，但**故意不合并成一条**：它们各自关闭的
+    # 是一个独立分支，而任何一条分支单独失效，另外两条仍然正常工作 ——
+    # 合并成一条大变异体的话，"哪一部分还有牙"就没人知道了。
+    Mutation(
+        ident="M43 封面地址不再判定字面 IP（内网/保留网段放行）",
+        rel_path="services/api/internal/service/product.go",
+        old="\t\tif ipIsNonPublic(ip) {",
+        new="\t\tif false {",
+        expect_fail=[
+            "TestValidateCoverURL_RejectsNonPublicHosts",
+            "TestValidateCoverURL_AllowsPublicHosts",
+        ],
+        why="关掉字面 IP 判定之后，`http://169.254.169.254/latest/meta-data/` 这类"
+        "云元数据地址可以原样存成商品封面。今天服务端不抓取，所以它还不是活的 SSRF；"
+        "但它是一条**已经通过校验、躺在库里**的载荷 —— 将来谁加了缩略图抓取就自动生效，"
+        "而那时没人会想到校验这一层曾经放它进来。",
+        note="注意 expect_fail 里两条测试方向相反：RejectsNonPublicHosts 证明「内网要拒」，"
+        "AllowsPublicHosts 证明「公网要放」。只留前者的守卫会被「一律拒绝」的坏实现骗过，"
+        "而那会把 `https://s3.amazonaws.com/...` 这种真实图床一起挡掉。"
+        "另外这条锚点在 *RejectsNonPublicHosts 的「带端口」那几条上是冗余的 —— "
+        "`u.Hostname()` 那层的断言不经过这里也能拦下带端口的写法，"
+        "所以真正让它变红的是不带端口的 `10.0.0.5`、`169.254.169.254` 那几条。",
+    ),
+    Mutation(
+        ident="M44 主机名不归一化（大小写与末尾根点可绕过）",
+        rel_path="services/api/internal/service/product.go",
+        old='\th := strings.ToLower(strings.TrimSuffix(host, "."))',
+        new="\th := host",
+        expect_fail=["TestValidateCoverURL_RejectsNonPublicHosts"],
+        why="主机名大小写不敏感、末尾根点等价，这两条都是 DNS 的既定语义 —— "
+        "不归一化的话 `http://LOCALHOST/a.png` 与 `http://localhost./a.png` "
+        "会直接穿过检查。这是这一类检查最经典的写坏方式："
+        "检查确实在跑、对 `localhost` 也确实拦得住，只有换个写法才漏。",
+        note="只改归一化、不动后缀表：这样它证明的是「归一化这一步有牙」，"
+        "而不是「整个后缀判定有牙」（后者是 M45）。"
+        "对应测试里的 `LOCALHOST 大写` 与 `localhost 末尾根点` 两条子用例。",
+    ),
+    Mutation(
+        ident="M45 本机/私网域名后缀表被清空",
+        rel_path="services/api/internal/service/product.go",
+        old='var nonPublicHostSuffixes = []string{".localhost", ".local", ".internal"}',
+        new="var nonPublicHostSuffixes = []string{}",
+        expect_fail=["TestValidateCoverURL_RejectsNonPublicHosts"],
+        why="表清空后 `images.localhost`、`printer.local`、`storage.internal` 会被放行。"
+        "`.local` 是 mDNS 段、`.internal` 是 ICANN 保留的私有 TLD，两者都**保证不解析到公网**，"
+        "所以这些地址在真实用户设备上永远加载不出来 —— 商户填了也只会得到一个白框。",
+        note="这条不会让 `localhost` 本身失守（那个由 `h == \"localhost\"` 精确匹配拦，"
+        "因为 \".localhost\" 作为后缀匹配不到裸的 \"localhost\"）。"
+        "两处是互补关系而不是重复：精确匹配管裸名，后缀表管子域 —— "
+        "所以只测「localhost 被拒」是覆盖不到这条的。",
+    ),
 ]
 
 
@@ -715,7 +862,7 @@ def main() -> int:
     ap.add_argument(
         "--no-baseline",
         action="store_true",
-        help="跳过基线全量测试（分批续跑时用，省一次 221 测试的等待）",
+        help="跳过基线全量测试（分批续跑时用，省一次基线跑的等待）",
     )
     ap.add_argument(
         "--audit",

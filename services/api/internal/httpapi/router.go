@@ -18,6 +18,7 @@ import (
 	"github.com/tutic/itiao-mall/services/api/internal/domain"
 	"github.com/tutic/itiao-mall/services/api/internal/httpapi/gen"
 	"github.com/tutic/itiao-mall/services/api/internal/payment"
+	"github.com/tutic/itiao-mall/services/api/internal/platform/logging"
 	"github.com/tutic/itiao-mall/services/api/internal/ratelimit"
 	"github.com/tutic/itiao-mall/services/api/internal/repo"
 	"github.com/tutic/itiao-mall/services/api/internal/service"
@@ -132,7 +133,32 @@ func NewRouter(d Deps) http.Handler {
 	return gen.HandlerFromMux(strict, r)
 }
 
+// readyz 是编排层探针。
+//
+// 响应体里 checks 的值只允许是**固定枚举**（"ok" / "unavailable"）。
+// 依赖错误的原文绝不能出现在这里 —— err.Error() 带着内网地址与端口，
+// pgx 还会带上 host=/user=/database=，而 /readyz 是公开路由（探针不该要 token），
+// 等于把内网拓扑白送给任何能发请求的人。实测过的原始响应：
+//
+//	{"checks":{"redis":"dial tcp [::1]:6379: connectex: No connection could be made ..."},
+//	 "status":"unavailable"}
+//
+// 细节只进日志：要排查的人有日志可看，外部不需要。
+//
+// 部署层还有第二道：/readyz 应限制在网关内网白名单，不该对公网暴露。
 func readyz(d Deps) http.HandlerFunc {
+	return readyzHandler(
+		func(ctx context.Context) error { return d.Pool.Ping(ctx) },
+		func(ctx context.Context) error { return d.Redis.Ping(ctx).Err() },
+	)
+}
+
+// readyzHandler 与 readyz 拆开，只为了测试能注入"返回含内网地址的假依赖"。
+//
+// 为什么必须走注入：靠"把 Redis 停掉"来测这条，测的是**环境**而不是代码 ——
+// 而且 refused 与 timeout 两种形态会得出不同结论（前者错误里带地址，后者不一定）。
+// 那样的守卫时绿时红，等于没有。
+func readyzHandler(pgPing, redisPing func(context.Context) error) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 		defer cancel()
@@ -140,13 +166,15 @@ func readyz(d Deps) http.HandlerFunc {
 		checks := map[string]string{"pg": "ok", "redis": "ok"}
 		healthy := true
 
-		if err := d.Pool.Ping(ctx); err != nil {
-			checks["pg"] = err.Error()
+		if err := pgPing(ctx); err != nil {
+			checks["pg"] = "unavailable"
 			healthy = false
+			logging.From(ctx).Error("readyz: PostgreSQL 不可用", slog.Any("err", err))
 		}
-		if err := d.Redis.Ping(ctx).Err(); err != nil {
-			checks["redis"] = err.Error()
+		if err := redisPing(ctx); err != nil {
+			checks["redis"] = "unavailable"
 			healthy = false
+			logging.From(ctx).Error("readyz: Redis 不可用", slog.Any("err", err))
 		}
 
 		if !healthy {

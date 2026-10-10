@@ -102,7 +102,9 @@ func rateLimitGate(limiter *ratelimit.Limiter, table []rateRule, def ratelimit.D
 					"path", r.URL.Path,
 					"scope", scope,
 					"fails_closed", limiter.FailsClosed(),
-					"err", err,
+					// 显式取 Cause：BackendError.Error() 只回哨兵文案（防内网地址外泄），
+					// 直接记 err 会把诊断信息一起丢掉。原文只进这里，不回响应体。
+					"err", ratelimit.Cause(err),
 				)
 				// fail-closed 时 Decide 返回 Allowed=false，此时**不能**回 429。
 				// 429 会被客户端读成"你太频繁了"从而退避不重试 ——

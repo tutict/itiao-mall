@@ -39,6 +39,16 @@ type Deps struct {
 	// 写死：它要同时决定 Redis 缓存的 TTL 与数据库行的 expires_at，
 	// 两处一旦不一致就会出现"缓存先过期"或"库里的行还在但缓存没了"的窗口。
 	RefreshTTL time.Duration
+	// Now 是"判定凭证是否过期"用的时钟，允许为空（默认 time.Now）。
+	//
+	// 之所以可注入：refresh 的两道防线（service 的过期预检、SQL CAS 的
+	// expires_at 条件）互为备份，正常情况下预检先拦，SQL 那层**永远不会被执行到** ——
+	// 于是删掉它也不会有任何测试变红，那层守卫等于没被验证过。
+	//
+	// 注入一个回拨的时钟就能把这道预检"骗过去"：库里那行已经过期，而预检
+	// 以为还没到时间，于是请求落到 SQL CAS 上 —— 兜底路径因此变得可达、可断言。
+	// 生产不传，行为与直接用 time.Now 完全一致。
+	Now func() time.Time
 }
 
 type Service struct {
@@ -59,6 +69,17 @@ func (s *Service) Logger() *slog.Logger {
 		return slog.New(slog.DiscardHandler)
 	}
 	return s.Deps.Logger
+}
+
+// clock 返回凭证过期判定所用的当前时间；未注入时就是 time.Now。
+//
+// 收在一处而不是散落调用 time.Now()：这样"判定过期"这个动作只有唯一的
+// 时钟来源，测试注入才有意义（散落的话漏掉一处就又不可控了）。
+func (s *Service) clock() time.Time {
+	if s.Deps.Now == nil {
+		return time.Now()
+	}
+	return s.Deps.Now()
 }
 
 // Session 是登录/刷新后返回给客户端的凭证组合。

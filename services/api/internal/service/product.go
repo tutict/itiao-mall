@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"net/url"
 	"strings"
 	"time"
@@ -585,6 +586,15 @@ func (s *Service) ReviewProduct(
 //
 // 顺带把长度校验收进来：它和格式校验是同一件事的两面
 // （"这个字段能不能进渲染路径"），分开写在两处迟早会漏掉一处。
+//
+// 最后一层是主机名：拒绝内网 / 保留网段与本机域名（见 rejectNonPublicHost）。
+// 这一层严格说不是 XSS 防线，而是两条别的边界：
+//   - 它挡住"误填内网地址"这类配置错误（`192.168.x.x`、云元数据地址），
+//     这类地址在真实用户设备上永远不会加载成功；
+//   - 它把"封面必须是公网可达地址"这条前提**写进代码**，
+//     这样将来若有人加了服务端抓取，那道 SSRF 缺口不会是从零开始的。
+//
+// 不变式（契约里也写了）：服务端**从不**解引用 cover_url，它只由客户端渲染。
 func validateCoverURL(raw string) error {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
@@ -613,6 +623,155 @@ func validateCoverURL(raw string) error {
 		// 落到前端就是一个永远加载失败的图。在这里挡住，比让商户在真机上
 		// 看到一个白框再回来问要好。
 		return domain.UserFacingf("封面地址缺少域名", domain.ErrValidation)
+	}
+	// 用 Hostname() 而不是 Host：Host 里带着端口（"127.0.0.1:8080"），
+	// 直接喂给 net.ParseIP 会解析失败，于是内网地址会被当成普通域名放行 ——
+	// 白名单开着、洞在后面。
+	if err := rejectNonPublicHost(u.Hostname()); err != nil {
+		return err
+	}
+	return nil
+}
+
+// errCoverURLNotPublic 是「封面指向内网」的统一文案。
+//
+// 抽成一个变量而不是在多处重复字面量：这段话是给商户看的，
+// 散成三份时改一处漏一处，同一个错误会出现两种说法。
+var errCoverURLNotPublic = domain.UserFacingf(
+	"封面地址不能指向内网或保留地址（请填写公网可访问的图片地址）", domain.ErrValidation)
+
+// nonPublicCIDRs 是「商品封面不可能合法落在其中」的网段。
+//
+// 为什么这里可以用黑名单，而上面 scheme 那里不行？
+// 因为两者的性质不同：URL scheme 是**开放集合**（浏览器与操作系统不断新增，
+// 还能被自定义协议处理器接管），黑名单永远追不上；而"不可路由网段"是 IANA
+// 在 RFC 6890 / 特殊用途地址注册表里维护的**封闭清单**——抄得下来，也抄得完。
+//
+// 这不是 SSRF 防护。真正的 SSRF 防护是"服务端永不解引用这个地址"
+// （见契约里 cover_url 的说明与下面的 getter 注释）。本表的作用有两个：
+//  1. 把"误填内网/元数据地址"这种明显的配置错误挡在入库之前；
+//  2. 让"封面必须是公网可达地址"这条边界在代码里**显式存在** ——
+//     将来真有人要加服务端抓取时，他会先撞到这张表。
+//
+// 已知不覆盖，分两类。
+//
+// (a) 不是"漏了"而是"这一步不该管"的：DNS rebinding（只有解析之后才谈得上判定）、
+// 十进制/八进制形式的 IP 字面量（`http://2130706433/` 会被 net.ParseIP 当成
+// 主机名而放行）、以及"公网地址 302 到内网"。这三类都要求**先解析再判定**，
+// 那一步同时覆盖它们 —— 所以真正要加抓取时，正确做法是复用 ipIsNonPublic
+// 去判定**解析结果**，而不是在这里继续堆字符串规则。
+//
+// (b) 表里确实没列、但属于 IANA 特殊用途的网段（都是理论项：服务端不抓取）：
+//
+//	192.88.99.0/24  6to4 中继（RFC 7526 已弃用）
+//	2002::/16       6to4，内嵌一个 IPv4 —— 所以它能间接指向私网
+//	64:ff9b::/96    NAT64 知名前缀，同样内嵌 IPv4
+//	100::/64        discard-only
+//	2001::/23       其余 IETF 协议专用（2001:2::/48 基准测试、2001:10::/28 ORCHID 等）
+//
+// 另外 `fec0::/10`（RFC 3879 已弃用的站点本地）刻意**不列**：它早已不应被路由，
+// 且 TestIPIsNonPublic_Boundaries 显式把它钉在"放行"一侧。要改这个决定就得同时
+// 改那条断言 —— 别只改表。
+var nonPublicCIDRs = []string{
+	// ---- IPv4 ----
+	"0.0.0.0/8",       // RFC 1122「本网络」
+	"10.0.0.0/8",      // RFC 1918 私有
+	"100.64.0.0/10",   // RFC 6598 运营商级 NAT（共享地址段）
+	"127.0.0.0/8",     // 环回
+	"169.254.0.0/16",  // 链路本地；云元数据 169.254.169.254 就在这里
+	"172.16.0.0/12",   // RFC 1918 私有
+	"192.0.0.0/24",    // IETF 协议专用
+	"192.0.2.0/24",    // TEST-NET-1
+	"192.168.0.0/16",  // RFC 1918 私有
+	"198.18.0.0/15",   // 网络设备基准测试
+	"198.51.100.0/24", // TEST-NET-2
+	"203.0.113.0/24",  // TEST-NET-3
+	"224.0.0.0/4",     // 组播
+	"240.0.0.0/4",     // 保留（含 255.255.255.255 受限广播）
+	// ---- IPv6 ----
+	"::/128",        // 未指定
+	"::1/128",       // 环回
+	"fc00::/7",      // RFC 4193 唯一本地地址
+	"fe80::/10",     // 链路本地
+	"ff00::/8",      // 组播
+	"2001:db8::/32", // 文档用
+}
+
+// nonPublicHostSuffixes 是不可能是商品图床的域名后缀。
+//
+// 只有这几个后缀能做后缀匹配，因为它们在 RFC / ICANN 里都是**保证不解析到公网**的：
+//   - localhost  → RFC 6761，保证解析到环回
+//   - *.local    → RFC 6762 mDNS，只在局域网内解析
+//   - *.internal → ICANN 2024 保留给私有网络，永久不进根区
+//
+// 其余一律不猜：拿"看起来像内网"的后缀去拦普通域名，既拦不住真正的问题
+// （攻击者注册一个正常域名指向 127.0.0.1 照样过），又会误伤合法域名。
+var nonPublicHostSuffixes = []string{".localhost", ".local", ".internal"}
+
+// parsedNonPublicCIDRs 是 nonPublicCIDRs 解析后的形态。
+//
+// 在包初始化时解析一次、解析失败直接 panic：这张表是编译期常量，
+// 解析失败只可能是有人手写错了前缀长度。让它在**测试启动时**就炸，
+// 而不是在生产里静默失效 —— 静默失效的安全表等于没有安全表。
+var parsedNonPublicCIDRs = func() []*net.IPNet {
+	nets := make([]*net.IPNet, 0, len(nonPublicCIDRs))
+	for _, s := range nonPublicCIDRs {
+		_, n, err := net.ParseCIDR(s)
+		if err != nil {
+			panic(fmt.Sprintf("nonPublicCIDRs 里有非法 CIDR %q：%v", s, err))
+		}
+		nets = append(nets, n)
+	}
+	return nets
+}()
+
+// ipIsNonPublic 判断一个字面 IP 是否属于「不可能是商品图床」的地址。
+//
+// 先用标准库的语义谓词盖掉大部分。它们已经正确处理了 IPv4-mapped IPv6
+// （::ffff:127.0.0.1 会被 To4() 收回 127.0.0.1 再判定），所以不需要为
+// 这种写法单独写一条 —— 这正是"用语义谓词而不是自己按字节比较"的好处。
+// 标准库没覆盖的几段（CGNAT、TEST-NET、基准测试、保留段等）由 CIDR 表补。
+func ipIsNonPublic(ip net.IP) bool {
+	if ip.IsLoopback() || ip.IsUnspecified() || ip.IsPrivate() ||
+		ip.IsLinkLocalUnicast() || ip.IsMulticast() ||
+		ip.IsInterfaceLocalMulticast() || ip.IsLinkLocalMulticast() {
+		return true
+	}
+	for _, n := range parsedNonPublicCIDRs {
+		if n.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// rejectNonPublicHost 拒绝指向内网 / 保留网段的主机名。
+//
+// 只在 host 是**字面 IP** 或落在上述封闭后缀上时才拒绝；普通域名一律放行 ——
+// 一个域名最终解析到哪个 IP，不由此处的字符串决定，也不该在这里猜。
+func rejectNonPublicHost(host string) error {
+	// 两个必须归一化的点，漏掉任何一个都等于把检查写成"可绕过的"：
+	//   - 主机名大小写不敏感（"LOCALHOST" 与 "localhost" 等价）
+	//   - 末尾根点（"localhost." 是 localhost 的 FQDN 写法）
+	h := strings.ToLower(strings.TrimSuffix(host, "."))
+	if h == "" {
+		return nil
+	}
+
+	if ip := net.ParseIP(h); ip != nil {
+		if ipIsNonPublic(ip) {
+			return errCoverURLNotPublic
+		}
+		return nil
+	}
+
+	if h == "localhost" {
+		return errCoverURLNotPublic
+	}
+	for _, suffix := range nonPublicHostSuffixes {
+		if strings.HasSuffix(h, suffix) {
+			return errCoverURLNotPublic
+		}
 	}
 	return nil
 }

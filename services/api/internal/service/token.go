@@ -197,9 +197,14 @@ func (s *Service) Refresh(ctx context.Context, refreshToken string) (*Session, e
 		// 已吊销（登出过 / 封号清理过）。这是用户自己的正常操作，不吊销 family。
 		return nil, auth.ErrRefreshInvalid
 	}
-	if !existing.ExpiresAt.Valid || !existing.ExpiresAt.Time.After(time.Now()) {
+	if !existing.ExpiresAt.Valid || !existing.ExpiresAt.Time.After(s.clock()) {
 		// 过期不是攻击特征，所以也不吊销 family ——
 		// 同一设备的正常会话会被误伤，而攻击者本来也拿不到新 token。
+		//
+		// 注意这只是一道预检。真正的兜底是下面 SQL CAS 里的 `expires_at > now()`：
+		// 预检与 CAS 之间还有一次 Redis 往返，行可能在那段时间里过期。
+		// 两道都要有 —— 也正因此，SQL 那层需要单独的测试才可能被验证到
+		//（见 TestConsumeRefreshToken_SQLGuards 与 Deps.Now 的注释）。
 		return nil, auth.ErrRefreshInvalid
 	}
 

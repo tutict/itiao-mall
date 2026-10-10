@@ -3,6 +3,7 @@ package httpapi
 import (
 	"log/slog"
 	"net/http"
+	"regexp"
 	"time"
 
 	"github.com/google/uuid"
@@ -10,11 +11,22 @@ import (
 	"github.com/tutic/itiao-mall/services/api/internal/platform/logging"
 )
 
+// requestIDPattern 是允许客户端自带的 request id 形状。
+//
+// 为什么要白名单、而不是"非空就采信"：这个值会被写进响应头与**全部日志**，
+// 原样采信等于让调用方决定我们的日志长什么样 —— 可以塞超长串把日志行撑爆，
+// 也可以塞入特殊字符伪造日志关联（日志注入）。受限字符集同时保证它能安全地
+// 放进响应头（不触发 Go 的头部校验），不会在 Set 时静默失败。
+var requestIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
+
 // RequestID 给每个请求分配唯一 id，并写进 context 与响应头，方便串日志。
 func RequestID(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		id := r.Header.Get("X-Request-ID")
-		if id == "" {
+		if !requestIDPattern.MatchString(id) {
+			// 不合规就**丢弃并重新生成**，而不是"清洗后使用"：
+			// 清洗规则一旦有洞，流进日志的就是攻击者可控的值；
+			// 而重新生成的代价只是一个 uuid。
 			id = uuid.NewString()
 		}
 		w.Header().Set("X-Request-ID", id)

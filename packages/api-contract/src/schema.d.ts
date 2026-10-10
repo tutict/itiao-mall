@@ -677,6 +677,18 @@ export interface components {
             title: string;
             description?: string;
             category?: string;
+            /**
+             * @description 商品封面图片地址。必须以 `http://` 或 `https://` 开头，且指向**公网可达**地址。
+             *
+             *     服务端会拒绝内网与保留网段（`10/8`、`172.16/12`、`192.168/16`、环回、
+             *     链路本地含云元数据 `169.254.169.254`、CGNAT、TEST-NET 等）、IPv6 的
+             *     环回/ULA/链路本地，以及本机域名（`localhost`、`*.local`、`*.internal`）。
+             *
+             *     **不变式：服务端从不解引用这个地址。** 它只由客户端渲染
+             *     （App 的 `<Image source>`、Web 的 `<img src>`）。将来若要增加
+             *     服务端缩略图抓取，必须先做「DNS 解析 → 判定私网 → 再发请求」，
+             *     否则这里就是一条 SSRF 入口（纯字符串层面的网段检查挡不住 DNS rebinding）。
+             */
             cover_url?: string;
             skus: components["schemas"]["MerchantSkuRequest"][];
         };
@@ -901,7 +913,7 @@ export interface components {
         };
         MockNotifyRequest: {
             order_no: string;
-            amount_cents?: components["schemas"]["Money"];
+            amount_cents: components["schemas"]["Money"];
         };
         MockNotifyResult: {
             /** @description false 表示该回调此前已处理过（幂等命中） */

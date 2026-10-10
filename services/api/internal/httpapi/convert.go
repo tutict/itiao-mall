@@ -53,13 +53,6 @@ func derefInt32(p *int, def int32) int32 {
 	return def
 }
 
-func derefInt64(p *int64) int64 {
-	if p == nil {
-		return 0
-	}
-	return *p
-}
-
 func toGenUser(u repo.User) gen.User {
 	avatar := u.AvatarUrl
 	user := gen.User{

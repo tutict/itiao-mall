@@ -334,7 +334,18 @@ type MerchantProductPage struct {
 // 整体替换的代价是 SKU id 会变，因此**已有订单不受影响**：
 // 下单时已经把标题与单价快照进 `order_items` 了。
 type MerchantProductRequest struct {
-	Category    *string              `json:"category,omitempty"`
+	Category *string `json:"category,omitempty"`
+
+	// CoverUrl 商品封面图片地址。必须以 `http://` 或 `https://` 开头，且指向**公网可达**地址。
+	//
+	// 服务端会拒绝内网与保留网段（`10/8`、`172.16/12`、`192.168/16`、环回、
+	// 链路本地含云元数据 `169.254.169.254`、CGNAT、TEST-NET 等）、IPv6 的
+	// 环回/ULA/链路本地，以及本机域名（`localhost`、`*.local`、`*.internal`）。
+	//
+	// **不变式：服务端从不解引用这个地址。** 它只由客户端渲染
+	// （App 的 `<Image source>`、Web 的 `<img src>`）。将来若要增加
+	// 服务端缩略图抓取，必须先做「DNS 解析 → 判定私网 → 再发请求」，
+	// 否则这里就是一条 SSRF 入口（纯字符串层面的网段检查挡不住 DNS rebinding）。
 	CoverUrl    *string              `json:"cover_url,omitempty"`
 	Description *string              `json:"description,omitempty"`
 	Skus        []MerchantSkuRequest `json:"skus"`
@@ -418,7 +429,7 @@ type MerchantSkuRequest struct {
 // MockNotifyRequest defines model for MockNotifyRequest.
 type MockNotifyRequest struct {
 	// AmountCents 金额，单位为「分」
-	AmountCents *Money `json:"amount_cents,omitempty"`
+	AmountCents Money  `json:"amount_cents"`
 	OrderNo     string `json:"order_no"`
 }
 

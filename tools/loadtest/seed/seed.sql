@@ -61,6 +61,41 @@ SET shop_name = EXCLUDED.shop_name,
     status = EXCLUDED.status,
     updated_at = now();
 
+-- ---------- 2 号商户（跨租户隔离探针用）----------
+-- 为什么种子里要有**两个**商户：跨租户越权（别家的商品必须回 404 而不是 403）
+-- 只有存在第二个租户时才测得到。
+--
+-- 这个夹具原本放在 .workbuddy/ 下（不入库）。后果是 scripts/security-probe.mjs
+-- 的跨租户组在门禁里**从未执行过**：那组发现夹具缺失时会 skip()，而 skip()
+-- 只加计数、探针退出码只看 FAIL —— 于是那 6 条 check 一路绿着但从来没跑过。
+-- 这与 Go 侧刚修掉的「t.Skip 与真通过在退出码上无法区分」是同一个毛病。
+--
+-- 密码哈希与 1 号商户**逐字节相同**（明文见上面那行注释），所以探针不必再造
+-- 另一个凭据字面量：它复用已成功登录过的 PROBE_MERCHANT_PASSWORD 即可，
+-- 少一处会与种子走偏的副本。
+INSERT INTO users (id, role, phone, password_hash, nickname)
+VALUES (
+    '99999999-0000-4000-8000-000000000002',
+    'merchant',
+    '13800000001',
+    '$2a$10$7tskK/c0XD8nYLgZmVnIluMgiiPukVyuFgVSfknSFqoqWXwMnXXDC',
+    '越权探针商户'
+)
+ON CONFLICT (id) DO UPDATE
+SET phone = EXCLUDED.phone, password_hash = EXCLUDED.password_hash, updated_at = now();
+
+INSERT INTO merchant_profiles (user_id, shop_name, contact_name, contact_phone, status, reviewed_at)
+VALUES (
+    '99999999-0000-4000-8000-000000000002',
+    '越权探针店',
+    '探针联系人',
+    '13800000001',
+    'APPROVED',
+    now()
+)
+ON CONFLICT (user_id) DO UPDATE
+SET status = EXCLUDED.status, updated_at = now();
+
 -- ---------- 商品 ----------
 INSERT INTO products (id, merchant_id, title, description, category, cover_url, status)
 SELECT

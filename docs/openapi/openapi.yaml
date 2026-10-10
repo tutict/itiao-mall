@@ -1023,6 +1023,17 @@ components:
         cover_url:
           type: string
           maxLength: 500
+          description: |
+            商品封面图片地址。必须以 `http://` 或 `https://` 开头，且指向**公网可达**地址。
+
+            服务端会拒绝内网与保留网段（`10/8`、`172.16/12`、`192.168/16`、环回、
+            链路本地含云元数据 `169.254.169.254`、CGNAT、TEST-NET 等）、IPv6 的
+            环回/ULA/链路本地，以及本机域名（`localhost`、`*.local`、`*.internal`）。
+
+            **不变式：服务端从不解引用这个地址。** 它只由客户端渲染
+            （App 的 `<Image source>`、Web 的 `<img src>`）。将来若要增加
+            服务端缩略图抓取，必须先做「DNS 解析 → 判定私网 → 再发请求」，
+            否则这里就是一条 SSRF 入口（纯字符串层面的网段检查挡不住 DNS rebinding）。
         skus:
           type: array
           minItems: 1
@@ -1492,7 +1503,13 @@ components:
 
     MockNotifyRequest:
       type: object
-      required: [order_no]
+      # amount_cents 是必填的，而且这不是"格式要求"，是**语义要求**：
+      # 服务端以本地订单的 total_cents 裁决金额，报文里没有金额就无从比对，
+      # 只能拒绝（`ev.AmountCents <= 0` → 400）。契约里若写 optional，
+      # 客户端会以为"不传也行"，而实际结果是被金额闸门挡下来。
+      #
+      # 唯一的调用方（App 的支付页）本来就总是带上它。
+      required: [order_no, amount_cents]
       properties:
         order_no:
           type: string

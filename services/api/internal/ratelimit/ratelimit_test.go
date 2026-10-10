@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -385,27 +386,77 @@ func TestAllow_RejectsEmptySubject(t *testing.T) {
 //
 // 原文形如 "dial tcp 10.0.3.11:6379: connect: connection refused" ——
 // 里面是内网地址与拓扑。外泄等于给攻击者画地图。
+//
+// ★ 用**假后端**注入一条明确带内网地址的错误，而不是真去连一个死地址：
+// 真实 dial 失败的文本取决于是 refused 还是 timeout（后者常常不含地址），
+// 于是这样的断言时绿时红，而且本机形态变了它就不再证明任何事。
+// 旧版本还有一条 `t.Skip("Redis 未报错…")` —— 那让整条守卫变成环境相关，
+// 现在改成确定性断言：假的必然失败，不存在"没报错就跑过"的分支。
 func TestAllow_DoesNotLeakBackendAddress(t *testing.T) {
-	dead := redis.NewClient(&redis.Options{
-		Addr:        "127.0.0.1:1",
-		DialTimeout: 200 * time.Millisecond,
-	})
-	t.Cleanup(func() { _ = dead.Close() })
+	const leaky = "dial tcp 10.0.3.11:6379: connect: connection refused"
 
-	l := New(dead, "rl:leak", 500*time.Millisecond, false)
-	_, _, err := l.Decide(context.Background(), testPolicy("leak"), "u", testDefaults())
-	if err != nil {
-		// fail-open 下 Decide 不返回错误，所以这里只会走到 nil 分支。
-		// 真正要检查的是 Allow 本身的错误里有没有地址。
-		return
+	l := New(failingScripter{err: errors.New(leaky)}, "rl:leak", 500*time.Millisecond, true)
+
+	_, err := l.Allow(context.Background(), testPolicy("leak"), "u", testDefaults())
+	if err == nil {
+		t.Fatal("后端必然失败，Allow 必须返回错误")
 	}
-	_, aerr := l.Allow(context.Background(), testPolicy("leak"), "u", testDefaults())
-	if aerr == nil {
-		t.Skip("Redis 未报错（可能本机 1 端口有服务），跳过泄露检查")
+
+	// 1) 归因必须仍然成立 —— 否则 Decide 的 fail-closed 分支会静默失效。
+	if !errors.Is(err, ErrBackendUnavailable) {
+		t.Fatalf("应能 errors.Is(ErrBackendUnavailable)，实际 %v", err)
 	}
-	if got := aerr.Error(); contains(got, "127.0.0.1:1") || contains(got, "connection refused") {
-		t.Fatalf("错误里泄露了后端地址或系统错误原文: %s", got)
+	// 2) 对外文本里不能有内网地址、端口，也不能有底层系统错误原文。
+	got := err.Error()
+	for _, bad := range []string{"10.0.3.11", "6379", "connection refused", leaky} {
+		if strings.Contains(got, bad) {
+			t.Fatalf("错误文本泄露了后端细节 %q: %s", bad, got)
+		}
 	}
+	// 3) 但原文必须仍能被取出来写日志 —— 否则排查成本会转嫁给运维。
+	if cause := Cause(err); cause == nil || !strings.Contains(cause.Error(), "10.0.3.11") {
+		t.Fatalf("Cause 应保留底层原文供日志使用，实际: %v", cause)
+	}
+}
+
+// failingScripter 是一个"必然失败"的假 Redis 后端，错误文本可控。
+//
+// 实现 redis.Scripter 的 6 个方法即可 —— 这正是把 Limiter 的依赖面
+// 收窄到 Scripter（而不是 UniversalClient）换来的可测试性。
+type failingScripter struct{ err error }
+
+func (f failingScripter) failCmd(ctx context.Context) *redis.Cmd {
+	cmd := redis.NewCmd(ctx)
+	cmd.SetErr(f.err)
+	return cmd
+}
+
+func (f failingScripter) Eval(ctx context.Context, _ string, _ []string, _ ...any) *redis.Cmd {
+	return f.failCmd(ctx)
+}
+
+func (f failingScripter) EvalRO(ctx context.Context, _ string, _ []string, _ ...any) *redis.Cmd {
+	return f.failCmd(ctx)
+}
+
+func (f failingScripter) EvalSha(ctx context.Context, _ string, _ []string, _ ...any) *redis.Cmd {
+	return f.failCmd(ctx)
+}
+
+func (f failingScripter) EvalShaRO(ctx context.Context, _ string, _ []string, _ ...any) *redis.Cmd {
+	return f.failCmd(ctx)
+}
+
+func (f failingScripter) ScriptExists(ctx context.Context, _ ...string) *redis.BoolSliceCmd {
+	cmd := redis.NewBoolSliceCmd(ctx)
+	cmd.SetErr(f.err)
+	return cmd
+}
+
+func (f failingScripter) ScriptLoad(ctx context.Context, _ string) *redis.StringCmd {
+	cmd := redis.NewStringCmd(ctx)
+	cmd.SetErr(f.err)
+	return cmd
 }
 
 // ★ 判定必须有**自己的**超时上限，与调用方的 ctx 解耦。

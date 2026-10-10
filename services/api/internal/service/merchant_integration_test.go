@@ -13,7 +13,6 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/redis/go-redis/v9"
 
 	"github.com/tutic/itiao-mall/services/api/internal/auth"
 	"github.com/tutic/itiao-mall/services/api/internal/domain"
@@ -27,23 +26,14 @@ import (
 // 商户注册这条路径要签发 refresh token，而 refresh token 存在 Redis 里。
 // 用那个指向 127.0.0.1:1 的占位客户端会让所有注册用例在 issueSession 处炸掉 ——
 // 而炸的位置离真正要验证的东西很远，排查起来很不值。
+//
+// Redis 侧默认走 miniredis（见 newRedisForTest）。原来"连不上就 Skip"会让
+// 整个商户注册/审核套件在无 Redis 的机器上静默通过。
 func newMerchantTestService(t *testing.T) (*service.Service, *pgxpool.Pool) {
 	t.Helper()
 
 	pool := newTestPool(t)
-
-	redisAddr := os.Getenv("REDIS_ADDR")
-	if redisAddr == "" {
-		redisAddr = "localhost:6379"
-	}
-	rdb := redis.NewClient(&redis.Options{Addr: redisAddr})
-	t.Cleanup(func() { _ = rdb.Close() })
-
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	if err := rdb.Ping(ctx).Err(); err != nil {
-		t.Skipf("连不上 Redis(%s)，跳过：%v", redisAddr, err)
-	}
+	rdb := newRedisForTest(t)
 
 	svc := service.New(service.Deps{
 		Q:            repo.New(pool),

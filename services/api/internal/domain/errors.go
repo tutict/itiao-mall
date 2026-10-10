@@ -19,6 +19,10 @@ var (
 	ErrIdempotentHit       = errors.New("幂等键命中，返回既有结果")
 	ErrCartEmpty           = errors.New("购物车为空")
 	ErrPaymentNotPending   = errors.New("订单不处于待支付状态")
+	// ErrPaymentAmountMismatch 是回调金额与订单应付金额不符。
+	// 必须是独立哨兵而不是复用 ErrValidation：这条路径改变的是"钱是否对得上"，
+	// 将来要单独接告警（连续命中通常意味着有人在试探定价），复用会让告警没法分流。
+	ErrPaymentAmountMismatch = errors.New("支付金额与订单不符")
 	// ErrRateLimited 是限流命中。单独一个哨兵而不是复用 ErrConflict：
 	// 客户端对两者的处理完全不同（429 + 退避重试 vs 409 + 提示改参数），
 	// 混用会让重试策略失效 —— 对 409 重试是死循环。

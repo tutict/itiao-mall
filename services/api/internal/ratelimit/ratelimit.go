@@ -45,6 +45,48 @@ import (
 // 或者反过来 —— 限流形同虚设还查不出原因。
 var ErrBackendUnavailable = errors.New("限流后端不可用")
 
+// BackendError 包装"限流后端不可用"这一类失败。
+//
+// # 为什么需要一个类型，而不是 fmt.Errorf("%w: %v", ErrBackendUnavailable, err)
+//
+// 这个错误有两个去向，而它们对信息量的要求正好相反：
+//
+//   - 日志与排查：需要底层原文（"dial tcp 10.0.3.11:6379: connect: connection refused"）；
+//   - 任何**可能**回给客户端的路径：一个字都不能带（内网地址就是一张攻击地图）。
+//
+// 拼成一个字符串时，两个去向只能共用同一份文本 —— 想让日志有用，就得顺手把
+// 内网地址交给每一个能触发后端故障的人。拆开之后，Error() 只输出哨兵那句话，
+// Cause 由调用方**显式**取用（见 Cause 函数）。于是将来谁误把这个错误写进响应体，
+// 拿到的也只是"限流后端不可用"，而 errors.Is(err, ErrBackendUnavailable) 照常成立。
+type BackendError struct {
+	// Cause 是底层原因。**只允许进日志**，不要拼进任何对外文本。
+	Cause error
+}
+
+func (e *BackendError) Error() string { return ErrBackendUnavailable.Error() }
+
+// Unwrap 返回底层原因，让 errors.Is(err, 某个底层哨兵) 仍可穿透。
+func (e *BackendError) Unwrap() error { return e.Cause }
+
+// Is 让 errors.Is(err, ErrBackendUnavailable) 成立。
+//
+// 必须单独实现：Unwrap 指向 Cause 之后，错误链上就没有哨兵了 ——
+// 归因会静默失效，Decide 里的 fail-closed 分支不再成立，
+// 结果是"配置为收紧的限流器在 Redis 故障时变成放行"。
+func (e *BackendError) Is(target error) bool { return target == ErrBackendUnavailable }
+
+// Cause 取出 BackendError 里的底层原因（不是 BackendError 就原样返回）。
+//
+// 存在的意义是把"取原文"变成一个**显式动作**：只该写日志的调用方调它，
+// 而任何面向响应的代码路径都不会顺手拿到它。
+func Cause(err error) error {
+	var be *BackendError
+	if errors.As(err, &be) && be.Cause != nil {
+		return be.Cause
+	}
+	return err
+}
+
 // slidingWindowScript 是滑动窗口的原子实现。
 //
 // KEYS[1] = 窗口有序集合的 key
@@ -107,7 +149,12 @@ type Result struct {
 
 // Limiter 是限流器。零值不可用，必须用 New 构造。
 type Limiter struct {
-	rdb    redis.UniversalClient
+	// rdb 刻意只声明成 Scripter（Eval/EvalSha/ScriptExists/ScriptLoad），
+	// 不是 UniversalClient。限流器真正用到的只有"跑一段 Lua"这一件事，
+	// 把依赖面收到最小有两个好处：意图更清楚，以及测试可以注入一个
+	// 必然失败、且错误文本可控的假后端来验证"错误不外泄" ——
+	// 靠真连不上的 Redis 测那条，结论会随 refused/timeout 形态漂移。
+	rdb    redis.Scripter
 	prefix string
 
 	// 单次判定的超时。它独立于调用方的 ctx：调用方可能给了 30 秒的
@@ -146,7 +193,11 @@ type Limiter struct {
 // 修法是让限流器有一个 ReadTimeout 与自身 timeout 匹配的专用客户端
 // （见 main.go 的 newLimiterRedis）。**不要**图省事共用业务 Redis 客户端：
 // 把它的 ReadTimeout 调到几百毫秒会让 refresh 轮换在跨机房 Redis 上误超时。
-func New(rdb redis.UniversalClient, prefix string, timeout time.Duration, failsClosed bool) *Limiter {
+//
+// 参数类型是 redis.Scripter 而不是 UniversalClient：限流只用得到"执行 Lua"，
+// 收窄之后测试能注入假后端（见 Limiter.rdb 的注释）。*redis.Client 与
+// *redis.ClusterClient 都满足这个接口，调用方无需改动。
+func New(rdb redis.Scripter, prefix string, timeout time.Duration, failsClosed bool) *Limiter {
 	if prefix == "" {
 		prefix = "rl"
 	}
@@ -251,13 +302,18 @@ func (l *Limiter) Allow(ctx context.Context, p Policy, subject string, def Defau
 	if err != nil {
 		// 刻意**不**把 err 原样上抛给 HTTP 层：Redis 的错误原文含内网地址与
 		// 拓扑信息（"dial tcp 10.0.3.11:6379: connect: connection refused"），
-		// 外泄等于给攻击者画地图。原始错误只进日志，这里换成哨兵。
+		// 外泄等于给攻击者画地图。
+		//
+		// 注意这里**不能**写成 `fmt.Errorf("%w: %v", ErrBackendUnavailable, err)` ——
+		// 那正是这次要修掉的形态：拼成字符串之后，Error() 里必然带着原文，
+		// 任何把它写进响应体的路径都会泄露。改用 BackendError：哨兵在 Error() 里，
+		// 原文挂在 Cause 上只进日志。
 		if ctx.Err() != nil {
 			// 调用方自己取消了（客户端已断开 / HTTP 超时）。这不算后端故障，
 			// 也不该被算成"限流失败"而触发降级 —— 直接上抛调用方的 ctx 错误。
 			return Result{}, ctx.Err()
 		}
-		return Result{}, fmt.Errorf("%w: %v", ErrBackendUnavailable, err)
+		return Result{}, &BackendError{Cause: err}
 	}
 	if len(res) != 3 {
 		return Result{}, fmt.Errorf("%w: Lua 返回了 %d 个值，期望 3 个", ErrBackendUnavailable, len(res))

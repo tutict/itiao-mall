@@ -302,7 +302,21 @@ type NotifyResult struct {
 //  1. payment_events 的 (provider, transaction_id) 唯一约束 —— 同一笔交易只落一次；
 //  2. MarkOrderPaid 的 CAS —— 只有订单仍在待支付时才改状态。
 //
-// 先落事件再改状态：万一改状态失败，事件已留下痕迹，可据此重放。
+// 金额核对排在**落任何数据之前**。回调报文里的金额是对端"说的"，不是事实；
+// 以 out_trade_no 反查本地订单、用本地 total_cents 裁决，才是唯一可信的来源。
+// 采信报文等于把定价权交给能构造请求的人 —— 实测过 total_cents=2274 的订单
+// 被 amount_cents=1 的回调标记为已支付。
+//
+// 关键：金额不符时**连 payment_events 都不要碰**。这笔（错误的）交易号一旦占住
+// (provider, transaction_id) 唯一键，同一笔交易的真回调再到达时就会被幂等判定
+// 当成重复吞掉 —— 结果是用户付了钱、订单永远待支付。这是本条最容易写反的地方。
+//
+// （诚实说明：当前整段跑在一个事务里、拒绝路径会 defer Rollback，所以"先插入再
+// 核对"并不会真的把事件持久化。把核对放在插入之前的价值在于这条唯一键连被碰到
+// 的机会都没有 —— 将来若有人把插入挪出事务，这一步就是唯一防线。）
+//
+// 事件与状态变更在**同一个事务**里，因此同生共死：改状态失败时事件一并回滚
+// （见下面两个 ErrNoRows 分支里的显式 Rollback），不会留下"有事件、无状态"的半成品。
 func (s *Service) HandleNotify(ctx context.Context, body []byte, headers http.Header) (*NotifyResult, error) {
 	ev, err := s.Payment.ParseNotify(ctx, body, headers)
 	if err != nil {
@@ -315,6 +329,28 @@ func (s *Service) HandleNotify(ctx context.Context, body []byte, headers http.He
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	q := s.Q.WithTx(tx)
+
+	// ★ 反查本地订单 + 核对金额。
+	//
+	// 订单不存在时不再走"插事件 → MarkOrderPaid 失败 → 回滚"那条路：
+	// 那条路会先写一条指向未知订单的事件，且最终报 500（看起来像我们的 bug，
+	// 实际是对端发了个我们不认识的交易号），应直接回 404。
+	order, err := q.GetOrderByOrderNo(ctx, ev.OutTradeNo)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, fmt.Errorf("%w: 交易号 %s 无对应订单", domain.ErrNotFound, ev.OutTradeNo)
+		}
+		return nil, fmt.Errorf("查询订单失败: %w", err)
+	}
+	if ev.AmountCents <= 0 || ev.AmountCents != order.TotalCents {
+		s.Logger().Warn("支付回调金额与订单不符，已拒绝（订单保持待支付）",
+			"order_no", order.OrderNo,
+			"want_cents", order.TotalCents,
+			"got_cents", ev.AmountCents,
+			"transaction_id", ev.TransactionID,
+		)
+		return nil, domain.UserFacingf("支付金额与订单不符", domain.ErrPaymentAmountMismatch)
+	}
 
 	rawJSON := mustJSON(ev.Raw)
 	if _, err := q.InsertPaymentEvent(ctx, repo.InsertPaymentEventParams{
@@ -337,7 +373,7 @@ func (s *Service) HandleNotify(ctx context.Context, body []byte, headers http.He
 		return nil, fmt.Errorf("写入支付事件失败: %w", err)
 	}
 
-	order, err := q.MarkOrderPaid(ctx, ev.OutTradeNo)
+	order, err = q.MarkOrderPaid(ctx, ev.OutTradeNo)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			// 事件是新的，但订单已不在待支付状态（已被别的交易支付/已取消）。
