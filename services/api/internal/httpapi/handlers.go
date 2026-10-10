@@ -367,6 +367,199 @@ func (h *Handler) ReviewMerchant(ctx context.Context, req gen.ReviewMerchantRequ
 	return gen.ReviewMerchant200JSONResponse(toGenMerchantProfile(view)), nil
 }
 
+// ---------- 商户商品 ----------
+
+func (h *Handler) ListMerchantProducts(ctx context.Context, req gen.ListMerchantProductsRequestObject) (gen.ListMerchantProductsResponseObject, error) {
+	claims, err := mustUser(ctx)
+	if err != nil {
+		return nil, err
+	}
+	page := derefInt32(req.Params.Page, 1)
+	pageSize := derefInt32(req.Params.PageSize, 20)
+	status := ""
+	if req.Params.Status != nil {
+		status = string(*req.Params.Status)
+	}
+
+	views, total, err := h.svc.ListMerchantProducts(ctx, claims.UserID, status, page, pageSize)
+	if err != nil {
+		return nil, err
+	}
+	items := make([]gen.MerchantProduct, 0, len(views))
+	for i := range views {
+		items = append(items, toGenMerchantProduct(&views[i]))
+	}
+	return gen.ListMerchantProducts200JSONResponse{
+		Items: items, Total: int(total), Page: int(page), PageSize: int(pageSize),
+	}, nil
+}
+
+func (h *Handler) CreateMerchantProduct(ctx context.Context, req gen.CreateMerchantProductRequestObject) (gen.CreateMerchantProductResponseObject, error) {
+	claims, err := mustUser(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if req.Body == nil {
+		return nil, fmt.Errorf("%w: 请求体为空", domain.ErrValidation)
+	}
+	view, err := h.svc.CreateProduct(ctx, claims.UserID, toServiceProductInput(req.Body))
+	if err != nil {
+		return nil, err
+	}
+	return gen.CreateMerchantProduct201JSONResponse(toGenMerchantProduct(view)), nil
+}
+
+func (h *Handler) GetMerchantProduct(ctx context.Context, req gen.GetMerchantProductRequestObject) (gen.GetMerchantProductResponseObject, error) {
+	claims, err := mustUser(ctx)
+	if err != nil {
+		return nil, err
+	}
+	view, err := h.svc.GetMerchantProduct(ctx, claims.UserID, req.ProductId.String())
+	if err != nil {
+		return nil, err
+	}
+	return gen.GetMerchantProduct200JSONResponse(toGenMerchantProduct(view)), nil
+}
+
+func (h *Handler) UpdateMerchantProduct(ctx context.Context, req gen.UpdateMerchantProductRequestObject) (gen.UpdateMerchantProductResponseObject, error) {
+	claims, err := mustUser(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if req.Body == nil {
+		return nil, fmt.Errorf("%w: 请求体为空", domain.ErrValidation)
+	}
+	view, err := h.svc.UpdateProduct(ctx, claims.UserID, req.ProductId.String(), toServiceProductInput(req.Body))
+	if err != nil {
+		return nil, err
+	}
+	return gen.UpdateMerchantProduct200JSONResponse(toGenMerchantProduct(view)), nil
+}
+
+func (h *Handler) DeleteMerchantProduct(ctx context.Context, req gen.DeleteMerchantProductRequestObject) (gen.DeleteMerchantProductResponseObject, error) {
+	claims, err := mustUser(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if err := h.svc.DeleteProduct(ctx, claims.UserID, req.ProductId.String()); err != nil {
+		return nil, err
+	}
+	return gen.DeleteMerchantProduct204Response{}, nil
+}
+
+// 四个状态流转动作的 handler 形状完全一样，抽成一个辅助。
+//
+// 抽出来的收益是"回 200 + 读回详情"这条链只存在一份：
+// 之前入驻审核的 CAS 分散在两处，那种重复的代价是"有一处忘了读回"，
+// 而响应里就会缺字段，客户端按缺字段的分支渲染出一个空页面。
+func merchantProductAction(
+	ctx context.Context, h *Handler, userID, productID string,
+	action func(context.Context, string, string) (*service.ProductView, error),
+) (gen.MerchantProduct, error) {
+	view, err := action(ctx, userID, productID)
+	if err != nil {
+		return gen.MerchantProduct{}, err
+	}
+	return toGenMerchantProduct(view), nil
+}
+
+func (h *Handler) SubmitMerchantProduct(ctx context.Context, req gen.SubmitMerchantProductRequestObject) (gen.SubmitMerchantProductResponseObject, error) {
+	claims, err := mustUser(ctx)
+	if err != nil {
+		return nil, err
+	}
+	product, err := merchantProductAction(ctx, h, claims.UserID, req.ProductId.String(), h.svc.SubmitProduct)
+	if err != nil {
+		return nil, err
+	}
+	return gen.SubmitMerchantProduct200JSONResponse(product), nil
+}
+
+func (h *Handler) WithdrawMerchantProduct(ctx context.Context, req gen.WithdrawMerchantProductRequestObject) (gen.WithdrawMerchantProductResponseObject, error) {
+	claims, err := mustUser(ctx)
+	if err != nil {
+		return nil, err
+	}
+	product, err := merchantProductAction(ctx, h, claims.UserID, req.ProductId.String(), h.svc.WithdrawProduct)
+	if err != nil {
+		return nil, err
+	}
+	return gen.WithdrawMerchantProduct200JSONResponse(product), nil
+}
+
+func (h *Handler) OffShelfMerchantProduct(ctx context.Context, req gen.OffShelfMerchantProductRequestObject) (gen.OffShelfMerchantProductResponseObject, error) {
+	claims, err := mustUser(ctx)
+	if err != nil {
+		return nil, err
+	}
+	product, err := merchantProductAction(ctx, h, claims.UserID, req.ProductId.String(), h.svc.OffShelfProduct)
+	if err != nil {
+		return nil, err
+	}
+	return gen.OffShelfMerchantProduct200JSONResponse(product), nil
+}
+
+func (h *Handler) OnShelfMerchantProduct(ctx context.Context, req gen.OnShelfMerchantProductRequestObject) (gen.OnShelfMerchantProductResponseObject, error) {
+	claims, err := mustUser(ctx)
+	if err != nil {
+		return nil, err
+	}
+	product, err := merchantProductAction(ctx, h, claims.UserID, req.ProductId.String(), h.svc.OnShelfProduct)
+	if err != nil {
+		return nil, err
+	}
+	return gen.OnShelfMerchantProduct200JSONResponse(product), nil
+}
+
+// ---------- 商品审核 ----------
+
+func (h *Handler) ListProductsForReview(ctx context.Context, req gen.ListProductsForReviewRequestObject) (gen.ListProductsForReviewResponseObject, error) {
+	page := derefInt32(req.Params.Page, 1)
+	pageSize := derefInt32(req.Params.PageSize, 20)
+	status := ""
+	if req.Params.Status != nil {
+		status = string(*req.Params.Status)
+	}
+
+	views, total, err := h.svc.ListProductsForReview(ctx, status, page, pageSize)
+	if err != nil {
+		return nil, err
+	}
+	items := make([]gen.ReviewProduct, 0, len(views))
+	for i := range views {
+		items = append(items, toGenReviewProduct(&views[i]))
+	}
+	return gen.ListProductsForReview200JSONResponse{
+		Items: items, Total: int(total), Page: int(page), PageSize: int(pageSize),
+	}, nil
+}
+
+func (h *Handler) GetProductForReview(ctx context.Context, req gen.GetProductForReviewRequestObject) (gen.GetProductForReviewResponseObject, error) {
+	view, err := h.svc.GetProductForReview(ctx, req.ProductId.String())
+	if err != nil {
+		return nil, err
+	}
+	return gen.GetProductForReview200JSONResponse(toGenReviewProduct(view)), nil
+}
+
+func (h *Handler) ReviewProduct(ctx context.Context, req gen.ReviewProductRequestObject) (gen.ReviewProductResponseObject, error) {
+	claims, err := mustUser(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if req.Body == nil {
+		return nil, fmt.Errorf("%w: 请求体为空", domain.ErrValidation)
+	}
+	view, err := h.svc.ReviewProduct(
+		ctx, claims.UserID, req.ProductId.String(),
+		string(req.Body.Decision), derefStr(req.Body.RejectReason),
+	)
+	if err != nil {
+		return nil, err
+	}
+	return gen.ReviewProduct200JSONResponse(toGenReviewProduct(view)), nil
+}
+
 // ---------- 支付 ----------
 
 func (h *Handler) PrepayOrder(ctx context.Context, req gen.PrepayOrderRequestObject) (gen.PrepayOrderResponseObject, error) {

@@ -19,6 +19,22 @@ var (
 	ErrIdempotentHit       = errors.New("幂等键命中，返回既有结果")
 	ErrCartEmpty           = errors.New("购物车为空")
 	ErrPaymentNotPending   = errors.New("订单不处于待支付状态")
+	// ErrRateLimited 是限流命中。单独一个哨兵而不是复用 ErrConflict：
+	// 客户端对两者的处理完全不同（429 + 退避重试 vs 409 + 提示改参数），
+	// 混用会让重试策略失效 —— 对 409 重试是死循环。
+	ErrRateLimited = errors.New("请求过于频繁")
+	// ErrRateLimitUnavailable 是限流后端不可用且配置为 fail-closed。
+	// 回 503 而不是 429：429 告诉客户端"你太频繁了，等会儿"，
+	// 而这里的真实原因是"我们这边坏了"，让客户端退避重试才是对的。
+	ErrRateLimitUnavailable = errors.New("限流服务暂不可用")
+	// ErrPayloadTooLarge 是请求体超过上限。必须是独立的哨兵：
+	// 它最终映射成 413，而 400 会让客户端以为"改改参数就能过"，
+	// 于是拿同样的体积反复重试 —— 那正好是攻击者想要的效果。
+	ErrPayloadTooLarge = errors.New("请求体过大")
+	// ErrLengthRequired 是带 body 的请求没给 Content-Length（chunked 编码）。
+	// 映射成 411。这不是"格式不对"，而是"你用了我们不接受的那种传法"——
+	// 回 400 会让调用方去改内容，而他要改的是传输方式。
+	ErrLengthRequired = errors.New("缺少 Content-Length")
 )
 
 // UserFacing 是一个显式声明"这段文案可以给客户端看"的错误。

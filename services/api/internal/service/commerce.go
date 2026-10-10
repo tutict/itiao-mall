@@ -347,7 +347,7 @@ func (s *Service) HandleNotify(ctx context.Context, body []byte, headers http.He
 			if cerr != nil {
 				return nil, fmt.Errorf("查询订单失败: %w", cerr)
 			}
-			s.Logger.Warn("支付回调到达时订单不在待支付状态",
+			s.Logger().Warn("支付回调到达时订单不在待支付状态",
 				"order_no", cur.OrderNo, "status", cur.Status, "transaction_id", ev.TransactionID)
 			return &NotifyResult{Handled: false, OrderNo: cur.OrderNo, Status: cur.Status}, nil
 		}

@@ -140,6 +140,54 @@ func (e ProductDetailStatus) Valid() bool {
 	}
 }
 
+// Defines values for ProductReviewDecision.
+const (
+	ProductReviewDecisionOFFSALE  ProductReviewDecision = "OFF_SALE"
+	ProductReviewDecisionONSALE   ProductReviewDecision = "ON_SALE"
+	ProductReviewDecisionREJECTED ProductReviewDecision = "REJECTED"
+)
+
+// Valid indicates whether the value is a known member of the ProductReviewDecision enum.
+func (e ProductReviewDecision) Valid() bool {
+	switch e {
+	case ProductReviewDecisionOFFSALE:
+		return true
+	case ProductReviewDecisionONSALE:
+		return true
+	case ProductReviewDecisionREJECTED:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for ProductStatus.
+const (
+	ProductStatusDRAFT         ProductStatus = "DRAFT"
+	ProductStatusOFFSALE       ProductStatus = "OFF_SALE"
+	ProductStatusONSALE        ProductStatus = "ON_SALE"
+	ProductStatusPENDINGREVIEW ProductStatus = "PENDING_REVIEW"
+	ProductStatusREJECTED      ProductStatus = "REJECTED"
+)
+
+// Valid indicates whether the value is a known member of the ProductStatus enum.
+func (e ProductStatus) Valid() bool {
+	switch e {
+	case ProductStatusDRAFT:
+		return true
+	case ProductStatusOFFSALE:
+		return true
+	case ProductStatusONSALE:
+		return true
+	case ProductStatusPENDINGREVIEW:
+		return true
+	case ProductStatusREJECTED:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for ProductSummaryStatus.
 const (
 	ProductSummaryStatusDRAFT         ProductSummaryStatus = "DRAFT"
@@ -239,6 +287,60 @@ type Health struct {
 	Status string `json:"status"`
 }
 
+// MerchantProduct defines model for MerchantProduct.
+type MerchantProduct struct {
+	Category    *string            `json:"category,omitempty"`
+	CoverUrl    *string            `json:"cover_url,omitempty"`
+	CreatedAt   time.Time          `json:"created_at"`
+	Description *string            `json:"description,omitempty"`
+	Id          openapi_types.UUID `json:"id"`
+	MerchantId  openapi_types.UUID `json:"merchant_id"`
+
+	// MinPriceCents 最低 SKU 价，无 SKU 时为 0
+	MinPriceCents *Money `json:"min_price_cents,omitempty"`
+
+	// RejectReason 仅 `REJECTED` 时有值。重新提交后清空。
+	RejectReason *string    `json:"reject_reason,omitempty"`
+	ReviewedAt   *time.Time `json:"reviewed_at,omitempty"`
+	Skus         []Sku      `json:"skus"`
+
+	// Status 商品状态机。与 migration 0002 的 `products_status_check` 一一对应。
+	//
+	// ```
+	// DRAFT ──提交审核──> PENDING_REVIEW ──通过──> ON_SALE <──上架── OFF_SALE
+	//   │                      │                      │
+	//   └──改资料后重新提交──>  └──驳回──> REJECTED ────┘
+	// ```
+	// 注意**没有** `DRAFT → ON_SALE` 这条边：上架必须经平台审核。
+	Status      ProductStatus `json:"status"`
+	SubmittedAt *time.Time    `json:"submitted_at,omitempty"`
+	Title       string        `json:"title"`
+
+	// TotalStock 所有 SKU 库存之和
+	TotalStock *int64    `json:"total_stock,omitempty"`
+	UpdatedAt  time.Time `json:"updated_at"`
+}
+
+// MerchantProductPage defines model for MerchantProductPage.
+type MerchantProductPage struct {
+	Items    []MerchantProduct `json:"items"`
+	Page     int               `json:"page"`
+	PageSize int               `json:"page_size"`
+	Total    int               `json:"total"`
+}
+
+// MerchantProductRequest 商品与 SKU 一起提交。SKU 采用**整体替换**语义（编辑时先删后建）——
+// 增量增删改 SKU 需要额外的 diff 协议，而商品编辑不在热路径上。
+// 整体替换的代价是 SKU id 会变，因此**已有订单不受影响**：
+// 下单时已经把标题与单价快照进 `order_items` 了。
+type MerchantProductRequest struct {
+	Category    *string              `json:"category,omitempty"`
+	CoverUrl    *string              `json:"cover_url,omitempty"`
+	Description *string              `json:"description,omitempty"`
+	Skus        []MerchantSkuRequest `json:"skus"`
+	Title       string               `json:"title"`
+}
+
 // MerchantProfile defines model for MerchantProfile.
 type MerchantProfile struct {
 	ContactName  *string   `json:"contact_name,omitempty"`
@@ -304,6 +406,13 @@ type MerchantReviewRequest struct {
 
 	// RejectReason `decision=REJECTED` 时必填，服务端强制校验
 	RejectReason *string `json:"reject_reason,omitempty"`
+}
+
+// MerchantSkuRequest defines model for MerchantSkuRequest.
+type MerchantSkuRequest struct {
+	Name       string `json:"name"`
+	PriceCents Money  `json:"price_cents"`
+	Stock      int    `json:"stock"`
 }
 
 // MockNotifyRequest defines model for MockNotifyRequest.
@@ -418,6 +527,36 @@ type ProductPage struct {
 	Total    int              `json:"total"`
 }
 
+// ProductReviewDecision 商品审核结论：
+// - `ON_SALE` 通过（仅 `PENDING_REVIEW` 可裁决）
+// - `REJECTED` 驳回（仅 `PENDING_REVIEW` 可裁决，必须给理由）
+// - `OFF_SALE` 强制下架（在售与已下架都可，用于违规/投诉的事后处置）
+type ProductReviewDecision string
+
+// ProductReviewRequest defines model for ProductReviewRequest.
+type ProductReviewRequest struct {
+	// Decision 商品审核结论：
+	// - `ON_SALE` 通过（仅 `PENDING_REVIEW` 可裁决）
+	// - `REJECTED` 驳回（仅 `PENDING_REVIEW` 可裁决，必须给理由）
+	// - `OFF_SALE` 强制下架（在售与已下架都可，用于违规/投诉的事后处置）
+	Decision ProductReviewDecision `json:"decision"`
+
+	// RejectReason decision 为 REJECTED 时必填，服务端强制校验。
+	RejectReason *string `json:"reject_reason,omitempty"`
+}
+
+// ProductStatus 商品状态机。与 migration 0002 的 `products_status_check` 一一对应。
+//
+// ```
+// DRAFT ──提交审核──> PENDING_REVIEW ──通过──> ON_SALE <──上架── OFF_SALE
+//
+//	│                      │                      │
+//	└──改资料后重新提交──>  └──驳回──> REJECTED ────┘
+//
+// ```
+// 注意**没有** `DRAFT → ON_SALE` 这条边：上架必须经平台审核。
+type ProductStatus string
+
 // ProductSummary defines model for ProductSummary.
 type ProductSummary struct {
 	Category *string            `json:"category,omitempty"`
@@ -442,6 +581,51 @@ type PutCartItemRequest struct {
 // RefreshRequest defines model for RefreshRequest.
 type RefreshRequest struct {
 	RefreshToken string `json:"refresh_token"`
+}
+
+// ReviewProduct defines model for ReviewProduct.
+type ReviewProduct struct {
+	Category    *string            `json:"category,omitempty"`
+	CoverUrl    *string            `json:"cover_url,omitempty"`
+	CreatedAt   time.Time          `json:"created_at"`
+	Description *string            `json:"description,omitempty"`
+	Id          openapi_types.UUID `json:"id"`
+	MerchantId  openapi_types.UUID `json:"merchant_id"`
+
+	// MinPriceCents 最低 SKU 价，无 SKU 时为 0
+	MinPriceCents *Money `json:"min_price_cents,omitempty"`
+
+	// RejectReason 仅 `REJECTED` 时有值。重新提交后清空。
+	RejectReason *string    `json:"reject_reason,omitempty"`
+	ReviewedAt   *time.Time `json:"reviewed_at,omitempty"`
+
+	// ShopName 店铺名。审核员要靠它对上号，商户侧不需要所以不重复给。
+	ShopName *string `json:"shop_name,omitempty"`
+	Skus     []Sku   `json:"skus"`
+
+	// Status 商品状态机。与 migration 0002 的 `products_status_check` 一一对应。
+	//
+	// ```
+	// DRAFT ──提交审核──> PENDING_REVIEW ──通过──> ON_SALE <──上架── OFF_SALE
+	//   │                      │                      │
+	//   └──改资料后重新提交──>  └──驳回──> REJECTED ────┘
+	// ```
+	// 注意**没有** `DRAFT → ON_SALE` 这条边：上架必须经平台审核。
+	Status      ProductStatus `json:"status"`
+	SubmittedAt *time.Time    `json:"submitted_at,omitempty"`
+	Title       string        `json:"title"`
+
+	// TotalStock 所有 SKU 库存之和
+	TotalStock *int64    `json:"total_stock,omitempty"`
+	UpdatedAt  time.Time `json:"updated_at"`
+}
+
+// ReviewProductPage defines model for ReviewProductPage.
+type ReviewProductPage struct {
+	Items    []ReviewProduct `json:"items"`
+	Page     int             `json:"page"`
+	PageSize int             `json:"page_size"`
+	Total    int             `json:"total"`
 }
 
 // Sku defines model for Sku.
@@ -496,6 +680,22 @@ type ListMerchantsParams struct {
 	PageSize *int                   `form:"page_size,omitempty" json:"page_size,omitempty"`
 }
 
+// ListProductsForReviewParams defines parameters for ListProductsForReview.
+type ListProductsForReviewParams struct {
+	// Status 不传返回全部
+	Status   *ProductStatus `form:"status,omitempty" json:"status,omitempty"`
+	Page     *int           `form:"page,omitempty" json:"page,omitempty"`
+	PageSize *int           `form:"page_size,omitempty" json:"page_size,omitempty"`
+}
+
+// ListMerchantProductsParams defines parameters for ListMerchantProducts.
+type ListMerchantProductsParams struct {
+	// Status 不传返回全部
+	Status   *ProductStatus `form:"status,omitempty" json:"status,omitempty"`
+	Page     *int           `form:"page,omitempty" json:"page,omitempty"`
+	PageSize *int           `form:"page_size,omitempty" json:"page_size,omitempty"`
+}
+
 // ListOrdersParams defines parameters for ListOrders.
 type ListOrdersParams struct {
 	Status   *OrderStatus `form:"status,omitempty" json:"status,omitempty"`
@@ -520,6 +720,9 @@ type ListProductsParams struct {
 // ReviewMerchantJSONRequestBody defines body for ReviewMerchant for application/json ContentType.
 type ReviewMerchantJSONRequestBody = MerchantReviewRequest
 
+// ReviewProductJSONRequestBody defines body for ReviewProduct for application/json ContentType.
+type ReviewProductJSONRequestBody = ProductReviewRequest
+
 // LoginAdminJSONRequestBody defines body for LoginAdmin for application/json ContentType.
 type LoginAdminJSONRequestBody = PasswordLoginRequest
 
@@ -541,6 +744,12 @@ type LoginWechatJSONRequestBody = WechatLoginRequest
 // PutCartItemJSONRequestBody defines body for PutCartItem for application/json ContentType.
 type PutCartItemJSONRequestBody = PutCartItemRequest
 
+// CreateMerchantProductJSONRequestBody defines body for CreateMerchantProduct for application/json ContentType.
+type CreateMerchantProductJSONRequestBody = MerchantProductRequest
+
+// UpdateMerchantProductJSONRequestBody defines body for UpdateMerchantProduct for application/json ContentType.
+type UpdateMerchantProductJSONRequestBody = MerchantProductRequest
+
 // UpdateMerchantProfileJSONRequestBody defines body for UpdateMerchantProfile for application/json ContentType.
 type UpdateMerchantProfileJSONRequestBody = MerchantProfileUpdateRequest
 
@@ -558,6 +767,15 @@ type ServerInterface interface {
 	// ReviewMerchant 审核商户入驻
 	// (POST /api/v1/admin/merchants/{merchantId}/review)
 	ReviewMerchant(w http.ResponseWriter, r *http.Request, merchantId MerchantId)
+	// ListProductsForReview 商品审核队列
+	// (GET /api/v1/admin/products)
+	ListProductsForReview(w http.ResponseWriter, r *http.Request, params ListProductsForReviewParams)
+	// GetProductForReview 审核视角的商品详情
+	// (GET /api/v1/admin/products/{productId})
+	GetProductForReview(w http.ResponseWriter, r *http.Request, productId ProductId)
+	// ReviewProduct 审核商品
+	// (POST /api/v1/admin/products/{productId}/review)
+	ReviewProduct(w http.ResponseWriter, r *http.Request, productId ProductId)
 	// LoginAdmin 管理员端登录（手机号 + 密码）
 	// (POST /api/v1/auth/admin/login)
 	LoginAdmin(w http.ResponseWriter, r *http.Request)
@@ -588,6 +806,33 @@ type ServerInterface interface {
 	// GetMe 当前登录用户
 	// (GET /api/v1/me)
 	GetMe(w http.ResponseWriter, r *http.Request)
+	// ListMerchantProducts 我的商品列表（含全部状态）
+	// (GET /api/v1/merchant/products)
+	ListMerchantProducts(w http.ResponseWriter, r *http.Request, params ListMerchantProductsParams)
+	// CreateMerchantProduct 新建商品（草稿）
+	// (POST /api/v1/merchant/products)
+	CreateMerchantProduct(w http.ResponseWriter, r *http.Request)
+	// DeleteMerchantProduct 删除商品（仅草稿 / 被驳回）
+	// (DELETE /api/v1/merchant/products/{productId})
+	DeleteMerchantProduct(w http.ResponseWriter, r *http.Request, productId ProductId)
+	// GetMerchantProduct 商品详情（含 SKU）
+	// (GET /api/v1/merchant/products/{productId})
+	GetMerchantProduct(w http.ResponseWriter, r *http.Request, productId ProductId)
+	// UpdateMerchantProduct 编辑商品
+	// (PUT /api/v1/merchant/products/{productId})
+	UpdateMerchantProduct(w http.ResponseWriter, r *http.Request, productId ProductId)
+	// OffShelfMerchantProduct 下架（在售 → 已下架）
+	// (POST /api/v1/merchant/products/{productId}/off-shelf)
+	OffShelfMerchantProduct(w http.ResponseWriter, r *http.Request, productId ProductId)
+	// OnShelfMerchantProduct 上架（已下架 → 在售）
+	// (POST /api/v1/merchant/products/{productId}/on-shelf)
+	OnShelfMerchantProduct(w http.ResponseWriter, r *http.Request, productId ProductId)
+	// SubmitMerchantProduct 提交审核（草稿 → 待审）
+	// (POST /api/v1/merchant/products/{productId}/submit)
+	SubmitMerchantProduct(w http.ResponseWriter, r *http.Request, productId ProductId)
+	// WithdrawMerchantProduct 撤回审核（待审 → 草稿）
+	// (POST /api/v1/merchant/products/{productId}/withdraw)
+	WithdrawMerchantProduct(w http.ResponseWriter, r *http.Request, productId ProductId)
 	// GetMerchantProfile 查看自己的入驻资料与审核状态
 	// (GET /api/v1/merchant/profile)
 	GetMerchantProfile(w http.ResponseWriter, r *http.Request)
@@ -633,6 +878,24 @@ func (_ Unimplemented) ListMerchants(w http.ResponseWriter, r *http.Request, par
 // ReviewMerchant 审核商户入驻
 // (POST /api/v1/admin/merchants/{merchantId}/review)
 func (_ Unimplemented) ReviewMerchant(w http.ResponseWriter, r *http.Request, merchantId MerchantId) {
+	w.WriteHeader(http.StatusNotImplemented)
+}
+
+// ListProductsForReview 商品审核队列
+// (GET /api/v1/admin/products)
+func (_ Unimplemented) ListProductsForReview(w http.ResponseWriter, r *http.Request, params ListProductsForReviewParams) {
+	w.WriteHeader(http.StatusNotImplemented)
+}
+
+// GetProductForReview 审核视角的商品详情
+// (GET /api/v1/admin/products/{productId})
+func (_ Unimplemented) GetProductForReview(w http.ResponseWriter, r *http.Request, productId ProductId) {
+	w.WriteHeader(http.StatusNotImplemented)
+}
+
+// ReviewProduct 审核商品
+// (POST /api/v1/admin/products/{productId}/review)
+func (_ Unimplemented) ReviewProduct(w http.ResponseWriter, r *http.Request, productId ProductId) {
 	w.WriteHeader(http.StatusNotImplemented)
 }
 
@@ -693,6 +956,60 @@ func (_ Unimplemented) PutCartItem(w http.ResponseWriter, r *http.Request, skuId
 // GetMe 当前登录用户
 // (GET /api/v1/me)
 func (_ Unimplemented) GetMe(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusNotImplemented)
+}
+
+// ListMerchantProducts 我的商品列表（含全部状态）
+// (GET /api/v1/merchant/products)
+func (_ Unimplemented) ListMerchantProducts(w http.ResponseWriter, r *http.Request, params ListMerchantProductsParams) {
+	w.WriteHeader(http.StatusNotImplemented)
+}
+
+// CreateMerchantProduct 新建商品（草稿）
+// (POST /api/v1/merchant/products)
+func (_ Unimplemented) CreateMerchantProduct(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusNotImplemented)
+}
+
+// DeleteMerchantProduct 删除商品（仅草稿 / 被驳回）
+// (DELETE /api/v1/merchant/products/{productId})
+func (_ Unimplemented) DeleteMerchantProduct(w http.ResponseWriter, r *http.Request, productId ProductId) {
+	w.WriteHeader(http.StatusNotImplemented)
+}
+
+// GetMerchantProduct 商品详情（含 SKU）
+// (GET /api/v1/merchant/products/{productId})
+func (_ Unimplemented) GetMerchantProduct(w http.ResponseWriter, r *http.Request, productId ProductId) {
+	w.WriteHeader(http.StatusNotImplemented)
+}
+
+// UpdateMerchantProduct 编辑商品
+// (PUT /api/v1/merchant/products/{productId})
+func (_ Unimplemented) UpdateMerchantProduct(w http.ResponseWriter, r *http.Request, productId ProductId) {
+	w.WriteHeader(http.StatusNotImplemented)
+}
+
+// OffShelfMerchantProduct 下架（在售 → 已下架）
+// (POST /api/v1/merchant/products/{productId}/off-shelf)
+func (_ Unimplemented) OffShelfMerchantProduct(w http.ResponseWriter, r *http.Request, productId ProductId) {
+	w.WriteHeader(http.StatusNotImplemented)
+}
+
+// OnShelfMerchantProduct 上架（已下架 → 在售）
+// (POST /api/v1/merchant/products/{productId}/on-shelf)
+func (_ Unimplemented) OnShelfMerchantProduct(w http.ResponseWriter, r *http.Request, productId ProductId) {
+	w.WriteHeader(http.StatusNotImplemented)
+}
+
+// SubmitMerchantProduct 提交审核（草稿 → 待审）
+// (POST /api/v1/merchant/products/{productId}/submit)
+func (_ Unimplemented) SubmitMerchantProduct(w http.ResponseWriter, r *http.Request, productId ProductId) {
+	w.WriteHeader(http.StatusNotImplemented)
+}
+
+// WithdrawMerchantProduct 撤回审核（待审 → 草稿）
+// (POST /api/v1/merchant/products/{productId}/withdraw)
+func (_ Unimplemented) WithdrawMerchantProduct(w http.ResponseWriter, r *http.Request, productId ProductId) {
 	w.WriteHeader(http.StatusNotImplemented)
 }
 
@@ -841,6 +1158,117 @@ func (siw *ServerInterfaceWrapper) ReviewMerchant(w http.ResponseWriter, r *http
 
 	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		siw.Handler.ReviewMerchant(w, r, merchantId)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// ListProductsForReview operation middleware
+func (siw *ServerInterfaceWrapper) ListProductsForReview(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// Parameter object where we will unmarshal all parameters from the context
+	var params ListProductsForReviewParams
+
+	// ------------- Optional query parameter "status" -------------
+
+	err = runtime.BindQueryParameterWithOptions("form", true, false, "status", r.URL.Query(), &params.Status, runtime.BindQueryParameterOptions{Type: "string", Format: ""})
+	if err != nil {
+		var requiredError *runtime.RequiredParameterError
+		if errors.As(err, &requiredError) {
+			siw.ErrorHandlerFunc(w, r, &RequiredParamError{ParamName: "status"})
+		} else {
+			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "status", Err: err})
+		}
+		return
+	}
+
+	// ------------- Optional query parameter "page" -------------
+
+	err = runtime.BindQueryParameterWithOptions("form", true, false, "page", r.URL.Query(), &params.Page, runtime.BindQueryParameterOptions{Type: "integer", Format: ""})
+	if err != nil {
+		var requiredError *runtime.RequiredParameterError
+		if errors.As(err, &requiredError) {
+			siw.ErrorHandlerFunc(w, r, &RequiredParamError{ParamName: "page"})
+		} else {
+			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "page", Err: err})
+		}
+		return
+	}
+
+	// ------------- Optional query parameter "page_size" -------------
+
+	err = runtime.BindQueryParameterWithOptions("form", true, false, "page_size", r.URL.Query(), &params.PageSize, runtime.BindQueryParameterOptions{Type: "integer", Format: ""})
+	if err != nil {
+		var requiredError *runtime.RequiredParameterError
+		if errors.As(err, &requiredError) {
+			siw.ErrorHandlerFunc(w, r, &RequiredParamError{ParamName: "page_size"})
+		} else {
+			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "page_size", Err: err})
+		}
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.ListProductsForReview(w, r, params)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// GetProductForReview operation middleware
+func (siw *ServerInterfaceWrapper) GetProductForReview(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// ------------- Path parameter "productId" -------------
+	var productId ProductId
+
+	err = runtime.BindStyledParameterWithOptions("simple", "productId", chi.URLParam(r, "productId"), &productId, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "string", Format: "uuid", ValueIsUnescaped: r.URL.RawPath == ""})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "productId", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.GetProductForReview(w, r, productId)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// ReviewProduct operation middleware
+func (siw *ServerInterfaceWrapper) ReviewProduct(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// ------------- Path parameter "productId" -------------
+	var productId ProductId
+
+	err = runtime.BindStyledParameterWithOptions("simple", "productId", chi.URLParam(r, "productId"), &productId, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "string", Format: "uuid", ValueIsUnescaped: r.URL.RawPath == ""})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "productId", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.ReviewProduct(w, r, productId)
 	}))
 
 	for _, middleware := range siw.HandlerMiddlewares {
@@ -1005,6 +1433,261 @@ func (siw *ServerInterfaceWrapper) GetMe(w http.ResponseWriter, r *http.Request)
 
 	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		siw.Handler.GetMe(w, r)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// ListMerchantProducts operation middleware
+func (siw *ServerInterfaceWrapper) ListMerchantProducts(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// Parameter object where we will unmarshal all parameters from the context
+	var params ListMerchantProductsParams
+
+	// ------------- Optional query parameter "status" -------------
+
+	err = runtime.BindQueryParameterWithOptions("form", true, false, "status", r.URL.Query(), &params.Status, runtime.BindQueryParameterOptions{Type: "string", Format: ""})
+	if err != nil {
+		var requiredError *runtime.RequiredParameterError
+		if errors.As(err, &requiredError) {
+			siw.ErrorHandlerFunc(w, r, &RequiredParamError{ParamName: "status"})
+		} else {
+			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "status", Err: err})
+		}
+		return
+	}
+
+	// ------------- Optional query parameter "page" -------------
+
+	err = runtime.BindQueryParameterWithOptions("form", true, false, "page", r.URL.Query(), &params.Page, runtime.BindQueryParameterOptions{Type: "integer", Format: ""})
+	if err != nil {
+		var requiredError *runtime.RequiredParameterError
+		if errors.As(err, &requiredError) {
+			siw.ErrorHandlerFunc(w, r, &RequiredParamError{ParamName: "page"})
+		} else {
+			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "page", Err: err})
+		}
+		return
+	}
+
+	// ------------- Optional query parameter "page_size" -------------
+
+	err = runtime.BindQueryParameterWithOptions("form", true, false, "page_size", r.URL.Query(), &params.PageSize, runtime.BindQueryParameterOptions{Type: "integer", Format: ""})
+	if err != nil {
+		var requiredError *runtime.RequiredParameterError
+		if errors.As(err, &requiredError) {
+			siw.ErrorHandlerFunc(w, r, &RequiredParamError{ParamName: "page_size"})
+		} else {
+			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "page_size", Err: err})
+		}
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.ListMerchantProducts(w, r, params)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// CreateMerchantProduct operation middleware
+func (siw *ServerInterfaceWrapper) CreateMerchantProduct(w http.ResponseWriter, r *http.Request) {
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.CreateMerchantProduct(w, r)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// DeleteMerchantProduct operation middleware
+func (siw *ServerInterfaceWrapper) DeleteMerchantProduct(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// ------------- Path parameter "productId" -------------
+	var productId ProductId
+
+	err = runtime.BindStyledParameterWithOptions("simple", "productId", chi.URLParam(r, "productId"), &productId, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "string", Format: "uuid", ValueIsUnescaped: r.URL.RawPath == ""})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "productId", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.DeleteMerchantProduct(w, r, productId)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// GetMerchantProduct operation middleware
+func (siw *ServerInterfaceWrapper) GetMerchantProduct(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// ------------- Path parameter "productId" -------------
+	var productId ProductId
+
+	err = runtime.BindStyledParameterWithOptions("simple", "productId", chi.URLParam(r, "productId"), &productId, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "string", Format: "uuid", ValueIsUnescaped: r.URL.RawPath == ""})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "productId", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.GetMerchantProduct(w, r, productId)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// UpdateMerchantProduct operation middleware
+func (siw *ServerInterfaceWrapper) UpdateMerchantProduct(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// ------------- Path parameter "productId" -------------
+	var productId ProductId
+
+	err = runtime.BindStyledParameterWithOptions("simple", "productId", chi.URLParam(r, "productId"), &productId, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "string", Format: "uuid", ValueIsUnescaped: r.URL.RawPath == ""})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "productId", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.UpdateMerchantProduct(w, r, productId)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// OffShelfMerchantProduct operation middleware
+func (siw *ServerInterfaceWrapper) OffShelfMerchantProduct(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// ------------- Path parameter "productId" -------------
+	var productId ProductId
+
+	err = runtime.BindStyledParameterWithOptions("simple", "productId", chi.URLParam(r, "productId"), &productId, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "string", Format: "uuid", ValueIsUnescaped: r.URL.RawPath == ""})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "productId", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.OffShelfMerchantProduct(w, r, productId)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// OnShelfMerchantProduct operation middleware
+func (siw *ServerInterfaceWrapper) OnShelfMerchantProduct(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// ------------- Path parameter "productId" -------------
+	var productId ProductId
+
+	err = runtime.BindStyledParameterWithOptions("simple", "productId", chi.URLParam(r, "productId"), &productId, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "string", Format: "uuid", ValueIsUnescaped: r.URL.RawPath == ""})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "productId", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.OnShelfMerchantProduct(w, r, productId)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// SubmitMerchantProduct operation middleware
+func (siw *ServerInterfaceWrapper) SubmitMerchantProduct(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// ------------- Path parameter "productId" -------------
+	var productId ProductId
+
+	err = runtime.BindStyledParameterWithOptions("simple", "productId", chi.URLParam(r, "productId"), &productId, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "string", Format: "uuid", ValueIsUnescaped: r.URL.RawPath == ""})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "productId", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.SubmitMerchantProduct(w, r, productId)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// WithdrawMerchantProduct operation middleware
+func (siw *ServerInterfaceWrapper) WithdrawMerchantProduct(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// ------------- Path parameter "productId" -------------
+	var productId ProductId
+
+	err = runtime.BindStyledParameterWithOptions("simple", "productId", chi.URLParam(r, "productId"), &productId, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "string", Format: "uuid", ValueIsUnescaped: r.URL.RawPath == ""})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "productId", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.WithdrawMerchantProduct(w, r, productId)
 	}))
 
 	for _, middleware := range siw.HandlerMiddlewares {
@@ -1499,6 +2182,42 @@ func HandlerWithOptions(si ServerInterface, options ChiServerOptions) http.Handl
 	r.Group(func(r chi.Router) {
 		r.Post(options.BaseURL+"/api/v1/admin/merchants/{merchantId}/review", wrapper.ReviewMerchant)
 	})
+	r.Group(func(r chi.Router) {
+		r.Get(options.BaseURL+"/api/v1/merchant/products", wrapper.ListMerchantProducts)
+	})
+	r.Group(func(r chi.Router) {
+		r.Post(options.BaseURL+"/api/v1/merchant/products", wrapper.CreateMerchantProduct)
+	})
+	r.Group(func(r chi.Router) {
+		r.Delete(options.BaseURL+"/api/v1/merchant/products/{productId}", wrapper.DeleteMerchantProduct)
+	})
+	r.Group(func(r chi.Router) {
+		r.Get(options.BaseURL+"/api/v1/merchant/products/{productId}", wrapper.GetMerchantProduct)
+	})
+	r.Group(func(r chi.Router) {
+		r.Put(options.BaseURL+"/api/v1/merchant/products/{productId}", wrapper.UpdateMerchantProduct)
+	})
+	r.Group(func(r chi.Router) {
+		r.Post(options.BaseURL+"/api/v1/merchant/products/{productId}/submit", wrapper.SubmitMerchantProduct)
+	})
+	r.Group(func(r chi.Router) {
+		r.Post(options.BaseURL+"/api/v1/merchant/products/{productId}/withdraw", wrapper.WithdrawMerchantProduct)
+	})
+	r.Group(func(r chi.Router) {
+		r.Post(options.BaseURL+"/api/v1/merchant/products/{productId}/off-shelf", wrapper.OffShelfMerchantProduct)
+	})
+	r.Group(func(r chi.Router) {
+		r.Post(options.BaseURL+"/api/v1/merchant/products/{productId}/on-shelf", wrapper.OnShelfMerchantProduct)
+	})
+	r.Group(func(r chi.Router) {
+		r.Get(options.BaseURL+"/api/v1/admin/products", wrapper.ListProductsForReview)
+	})
+	r.Group(func(r chi.Router) {
+		r.Post(options.BaseURL+"/api/v1/admin/products/{productId}/review", wrapper.ReviewProduct)
+	})
+	r.Group(func(r chi.Router) {
+		r.Get(options.BaseURL+"/api/v1/admin/products/{productId}", wrapper.GetProductForReview)
+	})
 
 	return r
 }
@@ -1573,6 +2292,124 @@ type ReviewMerchantdefaultJSONResponse struct {
 }
 
 func (response ReviewMerchantdefaultJSONResponse) VisitReviewMerchantResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(response.StatusCode)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type ListProductsForReviewRequestObject struct {
+	Params ListProductsForReviewParams
+}
+
+type ListProductsForReviewResponseObject interface {
+	VisitListProductsForReviewResponse(w http.ResponseWriter) error
+}
+
+type ListProductsForReview200JSONResponse ReviewProductPage
+
+func (response ListProductsForReview200JSONResponse) VisitListProductsForReviewResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type ListProductsForReviewdefaultJSONResponse struct {
+	Body       Problem
+	StatusCode int
+}
+
+func (response ListProductsForReviewdefaultJSONResponse) VisitListProductsForReviewResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(response.StatusCode)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type GetProductForReviewRequestObject struct {
+	ProductId ProductId `json:"productId"`
+}
+
+type GetProductForReviewResponseObject interface {
+	VisitGetProductForReviewResponse(w http.ResponseWriter) error
+}
+
+type GetProductForReview200JSONResponse ReviewProduct
+
+func (response GetProductForReview200JSONResponse) VisitGetProductForReviewResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type GetProductForReviewdefaultJSONResponse struct {
+	Body       Problem
+	StatusCode int
+}
+
+func (response GetProductForReviewdefaultJSONResponse) VisitGetProductForReviewResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(response.StatusCode)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type ReviewProductRequestObject struct {
+	ProductId ProductId `json:"productId"`
+	Body      *ReviewProductJSONRequestBody
+}
+
+type ReviewProductResponseObject interface {
+	VisitReviewProductResponse(w http.ResponseWriter) error
+}
+
+type ReviewProduct200JSONResponse ReviewProduct
+
+func (response ReviewProduct200JSONResponse) VisitReviewProductResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type ReviewProductdefaultJSONResponse struct {
+	Body       Problem
+	StatusCode int
+}
+
+func (response ReviewProductdefaultJSONResponse) VisitReviewProductResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
@@ -1956,6 +2793,352 @@ type GetMedefaultJSONResponse struct {
 }
 
 func (response GetMedefaultJSONResponse) VisitGetMeResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(response.StatusCode)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type ListMerchantProductsRequestObject struct {
+	Params ListMerchantProductsParams
+}
+
+type ListMerchantProductsResponseObject interface {
+	VisitListMerchantProductsResponse(w http.ResponseWriter) error
+}
+
+type ListMerchantProducts200JSONResponse MerchantProductPage
+
+func (response ListMerchantProducts200JSONResponse) VisitListMerchantProductsResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type ListMerchantProductsdefaultJSONResponse struct {
+	Body       Problem
+	StatusCode int
+}
+
+func (response ListMerchantProductsdefaultJSONResponse) VisitListMerchantProductsResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(response.StatusCode)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type CreateMerchantProductRequestObject struct {
+	Body *CreateMerchantProductJSONRequestBody
+}
+
+type CreateMerchantProductResponseObject interface {
+	VisitCreateMerchantProductResponse(w http.ResponseWriter) error
+}
+
+type CreateMerchantProduct201JSONResponse MerchantProduct
+
+func (response CreateMerchantProduct201JSONResponse) VisitCreateMerchantProductResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(201)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type CreateMerchantProductdefaultJSONResponse struct {
+	Body       Problem
+	StatusCode int
+}
+
+func (response CreateMerchantProductdefaultJSONResponse) VisitCreateMerchantProductResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(response.StatusCode)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type DeleteMerchantProductRequestObject struct {
+	ProductId ProductId `json:"productId"`
+}
+
+type DeleteMerchantProductResponseObject interface {
+	VisitDeleteMerchantProductResponse(w http.ResponseWriter) error
+}
+
+type DeleteMerchantProduct204Response struct {
+}
+
+func (response DeleteMerchantProduct204Response) VisitDeleteMerchantProductResponse(w http.ResponseWriter) error {
+	w.WriteHeader(204)
+	return nil
+}
+
+type DeleteMerchantProductdefaultJSONResponse struct {
+	Body       Problem
+	StatusCode int
+}
+
+func (response DeleteMerchantProductdefaultJSONResponse) VisitDeleteMerchantProductResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(response.StatusCode)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type GetMerchantProductRequestObject struct {
+	ProductId ProductId `json:"productId"`
+}
+
+type GetMerchantProductResponseObject interface {
+	VisitGetMerchantProductResponse(w http.ResponseWriter) error
+}
+
+type GetMerchantProduct200JSONResponse MerchantProduct
+
+func (response GetMerchantProduct200JSONResponse) VisitGetMerchantProductResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type GetMerchantProductdefaultJSONResponse struct {
+	Body       Problem
+	StatusCode int
+}
+
+func (response GetMerchantProductdefaultJSONResponse) VisitGetMerchantProductResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(response.StatusCode)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type UpdateMerchantProductRequestObject struct {
+	ProductId ProductId `json:"productId"`
+	Body      *UpdateMerchantProductJSONRequestBody
+}
+
+type UpdateMerchantProductResponseObject interface {
+	VisitUpdateMerchantProductResponse(w http.ResponseWriter) error
+}
+
+type UpdateMerchantProduct200JSONResponse MerchantProduct
+
+func (response UpdateMerchantProduct200JSONResponse) VisitUpdateMerchantProductResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type UpdateMerchantProductdefaultJSONResponse struct {
+	Body       Problem
+	StatusCode int
+}
+
+func (response UpdateMerchantProductdefaultJSONResponse) VisitUpdateMerchantProductResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(response.StatusCode)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type OffShelfMerchantProductRequestObject struct {
+	ProductId ProductId `json:"productId"`
+}
+
+type OffShelfMerchantProductResponseObject interface {
+	VisitOffShelfMerchantProductResponse(w http.ResponseWriter) error
+}
+
+type OffShelfMerchantProduct200JSONResponse MerchantProduct
+
+func (response OffShelfMerchantProduct200JSONResponse) VisitOffShelfMerchantProductResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type OffShelfMerchantProductdefaultJSONResponse struct {
+	Body       Problem
+	StatusCode int
+}
+
+func (response OffShelfMerchantProductdefaultJSONResponse) VisitOffShelfMerchantProductResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(response.StatusCode)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type OnShelfMerchantProductRequestObject struct {
+	ProductId ProductId `json:"productId"`
+}
+
+type OnShelfMerchantProductResponseObject interface {
+	VisitOnShelfMerchantProductResponse(w http.ResponseWriter) error
+}
+
+type OnShelfMerchantProduct200JSONResponse MerchantProduct
+
+func (response OnShelfMerchantProduct200JSONResponse) VisitOnShelfMerchantProductResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type OnShelfMerchantProductdefaultJSONResponse struct {
+	Body       Problem
+	StatusCode int
+}
+
+func (response OnShelfMerchantProductdefaultJSONResponse) VisitOnShelfMerchantProductResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(response.StatusCode)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type SubmitMerchantProductRequestObject struct {
+	ProductId ProductId `json:"productId"`
+}
+
+type SubmitMerchantProductResponseObject interface {
+	VisitSubmitMerchantProductResponse(w http.ResponseWriter) error
+}
+
+type SubmitMerchantProduct200JSONResponse MerchantProduct
+
+func (response SubmitMerchantProduct200JSONResponse) VisitSubmitMerchantProductResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type SubmitMerchantProductdefaultJSONResponse struct {
+	Body       Problem
+	StatusCode int
+}
+
+func (response SubmitMerchantProductdefaultJSONResponse) VisitSubmitMerchantProductResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(response.StatusCode)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type WithdrawMerchantProductRequestObject struct {
+	ProductId ProductId `json:"productId"`
+}
+
+type WithdrawMerchantProductResponseObject interface {
+	VisitWithdrawMerchantProductResponse(w http.ResponseWriter) error
+}
+
+type WithdrawMerchantProduct200JSONResponse MerchantProduct
+
+func (response WithdrawMerchantProduct200JSONResponse) VisitWithdrawMerchantProductResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type WithdrawMerchantProductdefaultJSONResponse struct {
+	Body       Problem
+	StatusCode int
+}
+
+func (response WithdrawMerchantProductdefaultJSONResponse) VisitWithdrawMerchantProductResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
@@ -2364,6 +3547,15 @@ type StrictServerInterface interface {
 	// ReviewMerchant 审核商户入驻
 	// (POST /api/v1/admin/merchants/{merchantId}/review)
 	ReviewMerchant(ctx context.Context, request ReviewMerchantRequestObject) (ReviewMerchantResponseObject, error)
+	// ListProductsForReview 商品审核队列
+	// (GET /api/v1/admin/products)
+	ListProductsForReview(ctx context.Context, request ListProductsForReviewRequestObject) (ListProductsForReviewResponseObject, error)
+	// GetProductForReview 审核视角的商品详情
+	// (GET /api/v1/admin/products/{productId})
+	GetProductForReview(ctx context.Context, request GetProductForReviewRequestObject) (GetProductForReviewResponseObject, error)
+	// ReviewProduct 审核商品
+	// (POST /api/v1/admin/products/{productId}/review)
+	ReviewProduct(ctx context.Context, request ReviewProductRequestObject) (ReviewProductResponseObject, error)
 	// LoginAdmin 管理员端登录（手机号 + 密码）
 	// (POST /api/v1/auth/admin/login)
 	LoginAdmin(ctx context.Context, request LoginAdminRequestObject) (LoginAdminResponseObject, error)
@@ -2394,6 +3586,33 @@ type StrictServerInterface interface {
 	// GetMe 当前登录用户
 	// (GET /api/v1/me)
 	GetMe(ctx context.Context, request GetMeRequestObject) (GetMeResponseObject, error)
+	// ListMerchantProducts 我的商品列表（含全部状态）
+	// (GET /api/v1/merchant/products)
+	ListMerchantProducts(ctx context.Context, request ListMerchantProductsRequestObject) (ListMerchantProductsResponseObject, error)
+	// CreateMerchantProduct 新建商品（草稿）
+	// (POST /api/v1/merchant/products)
+	CreateMerchantProduct(ctx context.Context, request CreateMerchantProductRequestObject) (CreateMerchantProductResponseObject, error)
+	// DeleteMerchantProduct 删除商品（仅草稿 / 被驳回）
+	// (DELETE /api/v1/merchant/products/{productId})
+	DeleteMerchantProduct(ctx context.Context, request DeleteMerchantProductRequestObject) (DeleteMerchantProductResponseObject, error)
+	// GetMerchantProduct 商品详情（含 SKU）
+	// (GET /api/v1/merchant/products/{productId})
+	GetMerchantProduct(ctx context.Context, request GetMerchantProductRequestObject) (GetMerchantProductResponseObject, error)
+	// UpdateMerchantProduct 编辑商品
+	// (PUT /api/v1/merchant/products/{productId})
+	UpdateMerchantProduct(ctx context.Context, request UpdateMerchantProductRequestObject) (UpdateMerchantProductResponseObject, error)
+	// OffShelfMerchantProduct 下架（在售 → 已下架）
+	// (POST /api/v1/merchant/products/{productId}/off-shelf)
+	OffShelfMerchantProduct(ctx context.Context, request OffShelfMerchantProductRequestObject) (OffShelfMerchantProductResponseObject, error)
+	// OnShelfMerchantProduct 上架（已下架 → 在售）
+	// (POST /api/v1/merchant/products/{productId}/on-shelf)
+	OnShelfMerchantProduct(ctx context.Context, request OnShelfMerchantProductRequestObject) (OnShelfMerchantProductResponseObject, error)
+	// SubmitMerchantProduct 提交审核（草稿 → 待审）
+	// (POST /api/v1/merchant/products/{productId}/submit)
+	SubmitMerchantProduct(ctx context.Context, request SubmitMerchantProductRequestObject) (SubmitMerchantProductResponseObject, error)
+	// WithdrawMerchantProduct 撤回审核（待审 → 草稿）
+	// (POST /api/v1/merchant/products/{productId}/withdraw)
+	WithdrawMerchantProduct(ctx context.Context, request WithdrawMerchantProductRequestObject) (WithdrawMerchantProductResponseObject, error)
 	// GetMerchantProfile 查看自己的入驻资料与审核状态
 	// (GET /api/v1/merchant/profile)
 	GetMerchantProfile(ctx context.Context, request GetMerchantProfileRequestObject) (GetMerchantProfileResponseObject, error)
@@ -2517,6 +3736,91 @@ func (sh *strictHandler) ReviewMerchant(w http.ResponseWriter, r *http.Request, 
 		sh.options.ResponseErrorHandlerFunc(w, r, err)
 	} else if validResponse, ok := response.(ReviewMerchantResponseObject); ok {
 		if err := validResponse.VisitReviewMerchantResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// ListProductsForReview operation middleware
+func (sh *strictHandler) ListProductsForReview(w http.ResponseWriter, r *http.Request, params ListProductsForReviewParams) {
+	var request ListProductsForReviewRequestObject
+
+	request.Params = params
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.ListProductsForReview(ctx, request.(ListProductsForReviewRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "ListProductsForReview")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(ListProductsForReviewResponseObject); ok {
+		if err := validResponse.VisitListProductsForReviewResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// GetProductForReview operation middleware
+func (sh *strictHandler) GetProductForReview(w http.ResponseWriter, r *http.Request, productId ProductId) {
+	var request GetProductForReviewRequestObject
+
+	request.ProductId = productId
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.GetProductForReview(ctx, request.(GetProductForReviewRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "GetProductForReview")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(GetProductForReviewResponseObject); ok {
+		if err := validResponse.VisitGetProductForReviewResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// ReviewProduct operation middleware
+func (sh *strictHandler) ReviewProduct(w http.ResponseWriter, r *http.Request, productId ProductId) {
+	var request ReviewProductRequestObject
+
+	request.ProductId = productId
+
+	var body ReviewProductJSONRequestBody
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		sh.options.RequestErrorHandlerFunc(w, r, fmt.Errorf("can't decode JSON body: %w", err))
+		return
+	}
+	request.Body = &body
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.ReviewProduct(ctx, request.(ReviewProductRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "ReviewProduct")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(ReviewProductResponseObject); ok {
+		if err := validResponse.VisitReviewProductResponse(w); err != nil {
 			sh.options.ResponseErrorHandlerFunc(w, r, err)
 		}
 	} else if response != nil {
@@ -2810,6 +4114,252 @@ func (sh *strictHandler) GetMe(w http.ResponseWriter, r *http.Request) {
 		sh.options.ResponseErrorHandlerFunc(w, r, err)
 	} else if validResponse, ok := response.(GetMeResponseObject); ok {
 		if err := validResponse.VisitGetMeResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// ListMerchantProducts operation middleware
+func (sh *strictHandler) ListMerchantProducts(w http.ResponseWriter, r *http.Request, params ListMerchantProductsParams) {
+	var request ListMerchantProductsRequestObject
+
+	request.Params = params
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.ListMerchantProducts(ctx, request.(ListMerchantProductsRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "ListMerchantProducts")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(ListMerchantProductsResponseObject); ok {
+		if err := validResponse.VisitListMerchantProductsResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// CreateMerchantProduct operation middleware
+func (sh *strictHandler) CreateMerchantProduct(w http.ResponseWriter, r *http.Request) {
+	var request CreateMerchantProductRequestObject
+
+	var body CreateMerchantProductJSONRequestBody
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		sh.options.RequestErrorHandlerFunc(w, r, fmt.Errorf("can't decode JSON body: %w", err))
+		return
+	}
+	request.Body = &body
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.CreateMerchantProduct(ctx, request.(CreateMerchantProductRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "CreateMerchantProduct")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(CreateMerchantProductResponseObject); ok {
+		if err := validResponse.VisitCreateMerchantProductResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// DeleteMerchantProduct operation middleware
+func (sh *strictHandler) DeleteMerchantProduct(w http.ResponseWriter, r *http.Request, productId ProductId) {
+	var request DeleteMerchantProductRequestObject
+
+	request.ProductId = productId
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.DeleteMerchantProduct(ctx, request.(DeleteMerchantProductRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "DeleteMerchantProduct")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(DeleteMerchantProductResponseObject); ok {
+		if err := validResponse.VisitDeleteMerchantProductResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// GetMerchantProduct operation middleware
+func (sh *strictHandler) GetMerchantProduct(w http.ResponseWriter, r *http.Request, productId ProductId) {
+	var request GetMerchantProductRequestObject
+
+	request.ProductId = productId
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.GetMerchantProduct(ctx, request.(GetMerchantProductRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "GetMerchantProduct")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(GetMerchantProductResponseObject); ok {
+		if err := validResponse.VisitGetMerchantProductResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// UpdateMerchantProduct operation middleware
+func (sh *strictHandler) UpdateMerchantProduct(w http.ResponseWriter, r *http.Request, productId ProductId) {
+	var request UpdateMerchantProductRequestObject
+
+	request.ProductId = productId
+
+	var body UpdateMerchantProductJSONRequestBody
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		sh.options.RequestErrorHandlerFunc(w, r, fmt.Errorf("can't decode JSON body: %w", err))
+		return
+	}
+	request.Body = &body
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.UpdateMerchantProduct(ctx, request.(UpdateMerchantProductRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "UpdateMerchantProduct")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(UpdateMerchantProductResponseObject); ok {
+		if err := validResponse.VisitUpdateMerchantProductResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// OffShelfMerchantProduct operation middleware
+func (sh *strictHandler) OffShelfMerchantProduct(w http.ResponseWriter, r *http.Request, productId ProductId) {
+	var request OffShelfMerchantProductRequestObject
+
+	request.ProductId = productId
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.OffShelfMerchantProduct(ctx, request.(OffShelfMerchantProductRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "OffShelfMerchantProduct")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(OffShelfMerchantProductResponseObject); ok {
+		if err := validResponse.VisitOffShelfMerchantProductResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// OnShelfMerchantProduct operation middleware
+func (sh *strictHandler) OnShelfMerchantProduct(w http.ResponseWriter, r *http.Request, productId ProductId) {
+	var request OnShelfMerchantProductRequestObject
+
+	request.ProductId = productId
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.OnShelfMerchantProduct(ctx, request.(OnShelfMerchantProductRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "OnShelfMerchantProduct")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(OnShelfMerchantProductResponseObject); ok {
+		if err := validResponse.VisitOnShelfMerchantProductResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// SubmitMerchantProduct operation middleware
+func (sh *strictHandler) SubmitMerchantProduct(w http.ResponseWriter, r *http.Request, productId ProductId) {
+	var request SubmitMerchantProductRequestObject
+
+	request.ProductId = productId
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.SubmitMerchantProduct(ctx, request.(SubmitMerchantProductRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "SubmitMerchantProduct")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(SubmitMerchantProductResponseObject); ok {
+		if err := validResponse.VisitSubmitMerchantProductResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// WithdrawMerchantProduct operation middleware
+func (sh *strictHandler) WithdrawMerchantProduct(w http.ResponseWriter, r *http.Request, productId ProductId) {
+	var request WithdrawMerchantProductRequestObject
+
+	request.ProductId = productId
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.WithdrawMerchantProduct(ctx, request.(WithdrawMerchantProductRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "WithdrawMerchantProduct")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(WithdrawMerchantProductResponseObject); ok {
+		if err := validResponse.VisitWithdrawMerchantProductResponse(w); err != nil {
 			sh.options.ResponseErrorHandlerFunc(w, r, err)
 		}
 	} else if response != nil {

@@ -81,6 +81,17 @@ func mapError(err error) (int, string) {
 	switch {
 	case errors.Is(err, domain.ErrNotFound):
 		return http.StatusNotFound, "资源不存在"
+	case errors.Is(err, domain.ErrRateLimitUnavailable):
+		// 503 而不是 429：这里的真实原因是"限流器坏了"，不是"你太频繁"。
+		// 回 429 会让客户端把它当成自己的问题而退避不重试，
+		// 于是限流器挂掉的整段时间里全站被客户端主动放弃。
+		return http.StatusServiceUnavailable, "服务暂不可用"
+	case errors.Is(err, domain.ErrRateLimited):
+		return http.StatusTooManyRequests, "请求过于频繁"
+	case errors.Is(err, domain.ErrPayloadTooLarge):
+		return http.StatusRequestEntityTooLarge, "请求体过大"
+	case errors.Is(err, domain.ErrLengthRequired):
+		return http.StatusLengthRequired, "缺少 Content-Length"
 	case errors.Is(err, domain.ErrInsufficientStock):
 		return http.StatusConflict, "库存不足"
 	case errors.Is(err, domain.ErrCartEmpty):

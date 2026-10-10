@@ -362,3 +362,47 @@ func (q *Queries) ListSkusByProduct(ctx context.Context, productID string) ([]Sk
 	}
 	return items, nil
 }
+
+const listSkusByProductIDs = `-- name: ListSkusByProductIDs :many
+SELECT id, product_id, name, price_cents, stock, created_at, updated_at FROM skus
+WHERE product_id = ANY($1::uuid[])
+ORDER BY product_id, price_cents, id
+`
+
+// ★ 一次取回一页商品的全部 SKU。
+//
+// 为什么需要它：商户后台的商品列表一页 20 个，若在 Go 里逐个查
+// ListSkusByProduct，那是 1 + 20 次往返。这一页每次打开都要走一遍，
+// 而它恰好是商户最常访问的界面。
+//
+// 传入的是**已经在应用层确认过归属**的商品 id 列表 ——
+// 租户隔离由调用它的 ListMerchantProducts 完成（那条 SQL 自带 merchant_id），
+// 这里不再重复过滤：多一层 merchant_id 不会更安全，只会让两个地方
+// 各有一份"哪些 id 是允许的"的知识，改一处漏一处就是越权。
+func (q *Queries) ListSkusByProductIDs(ctx context.Context, ids []string) ([]Sku, error) {
+	rows, err := q.db.Query(ctx, listSkusByProductIDs, ids)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Sku{}
+	for rows.Next() {
+		var i Sku
+		if err := rows.Scan(
+			&i.ID,
+			&i.ProductID,
+			&i.Name,
+			&i.PriceCents,
+			&i.Stock,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}

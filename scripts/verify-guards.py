@@ -28,11 +28,47 @@
     C:/Users/tutic/.workbuddy/binaries/python/versions/3.13.12/python.exe \
         scripts/verify-guards.py
 
+    # 分批跑（每条变异都要跑一遍全量测试，30+ 条一起跑会超时）
+    ... scripts/verify-guards.py --from 14 --to 19 --no-baseline
+
+    # 跑验证前先自检源码树里有没有残留变异体（上一轮被中断留下的）
+    ... scripts/verify-guards.py --audit
+
+    # 环境不完整时（PG / Redis 没起）收窄到不依赖它们的包
+    ... scripts/verify-guards.py --from 31 --to 36 \
+        --packages "./internal/config/... ./internal/httpapi/..."
+
 退出码：0 = 全部变异都被指定的测试抓住；非 0 = 有未证明项。
+
+「未证明」怎么排查
+------------------
+本脚本只报结论，不报原因。看到「未证明」时按这三类去查（2026-10-10 实测有效）：
+
+  A) **编译失败**。脚本输出里会写「只有包级失败，没有具名测试」，
+     或者你手动 `go build ./...` 就能看到。典型成因是变异体本身写坏了 ——
+     例如把 `_ = timeout` 塞进 struct 字面量里、或者改掉一个变量后它变成
+     "declared and not used"。**这类变异体证明的是「文件坏了」，不是「守卫有牙」，
+     必须重写变异体。**
+
+  B) **红了但不是指定测试**。多半是断言方向/范围不对，或者指定的那条测试
+     其实在 skip。手动单跑一次就能看清：
+         go test -count=1 -run '^TestXxx$' -v ./internal/...
+     一条经常被忽略的信号：`go test -v` 里出现 `--- SKIP: TestXxx`。
+     而 skip 与通过**在退出码上无法区分** —— 整个包可以全 skip 却退出码 0。
+
+  C) **测试全绿**。两种可能：
+       - 守卫是假的（断言方向反了、断言了别的东西）
+       - **这个变异体描述的后果根本不成立**。写变异体之前先问
+         「它描述的后果真的会发生吗」—— 恒为「未证明」的假条目比没有更坏，
+         因为它占着位置，让人以为那块有覆盖。
+     实测例子：M36 最初写的是「长度白名单扩大到 GET」，但 GET 的
+     `ContentLength` 是 0，两个检查都不触发，扩大之后**行为完全不变**。
+     换成「漏掉 PUT/PATCH」（更新商品走 PUT，且没有别的测试覆盖）后立刻被抓。
 """
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import os
@@ -43,6 +79,91 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 API_DIR = ROOT / "services" / "api"
+
+# 单次 go test 的硬上限。集成测试要连库，超过就当"卡住"处理并报出来，
+# 不能让它无限期挂着 —— 那会让"变异验证"变成一个看不出进度的黑盒。
+GO_TEST_TIMEOUT = int(os.environ.get("VERIFY_GUARDS_TEST_TIMEOUT", "900"))
+
+# 默认跑全部内部包。可用 --packages 收窄 —— 用于「PostgreSQL / Redis 没起，
+# 但想先验证不依赖它们的那批变异体」这种场景。
+#
+# 收窄是**有代价**的：跑一部分包意味着"变异没有影响到其他包"这件事没被验证。
+# 所以它只该用在环境不完整的时候，用完之后补一次全量。
+PACKAGES = "./internal/..."
+
+# 正在被变异改写、尚未还原的文件。栈顶是当前那一个。
+ACTIVE: list[tuple[Path, bytes]] = []
+
+
+def restore_active() -> None:
+    """把当前所有被改过的文件按原字节写回去。幂等。"""
+    for path, original in reversed(ACTIVE):
+        try:
+            path.write_bytes(original)
+        except OSError as exc:  # pragma: no cover - 只在磁盘出问题时走到
+            print(f"!! 还原 {path} 失败：{exc}", file=sys.stderr)
+
+
+def _install_signal_guards() -> None:
+    """让 SIGTERM / SIGINT / SIGHUP 也能还原，而不是留下污染的源码。"""
+    import signal
+
+    def handler(signum, _frame):
+        name = signal.Signals(signum).name
+        restore_active()
+        print(
+            f"\n收到 {name}，已还原 {len(ACTIVE)} 个被变异的文件后退出。",
+            file=sys.stderr,
+        )
+        # 恢复默认处置再自杀，保证第二次信号能立刻生效
+        signal.signal(signum, signal.SIG_DFL)
+        os.kill(os.getpid(), signum)
+
+    for sig in ("SIGTERM", "SIGINT", "SIGHUP", "SIGBREAK"):
+        s = getattr(signal, sig, None)
+        if s is not None:
+            try:
+                signal.signal(s, handler)
+            except (ValueError, OSError):  # pragma: no cover
+                pass
+
+
+def audit_clean() -> list[str]:
+    """检查所有变异体是否都处于「原始状态」。
+
+    这是**跑验证之前**必须做的一步。上一次运行被 SIGTERM 打断时，
+    M5 的变异体永久留在了 repo/merchant.sql.go 里（CAS 条件被改成
+    `status IS NOT NULL`）。那次之后：
+      - 基线不再全绿，失败原因看起来像"新写的测试有问题"；
+      - 而真正的病灶（源码被改坏）在任何测试输出里都不会出现。
+    所以：先证明树是干净的，再谈守卫有没有牙。
+    """
+    problems: list[str] = []
+    for m in MUTATIONS:
+        path = ROOT / m.rel_path
+        if not path.exists():
+            problems.append(f"{m.ident}：文件不存在 {m.rel_path}")
+            continue
+        text = path.read_bytes().decode("utf-8")
+        n_old = text.count(m.old)
+        n_new = text.count(m.new)
+        if n_old == 1:
+            # 原始文本在位且唯一 —— 一定没被施加过。
+            # 判定顺序不能反：很多 `new` 其实是 `old` 的子串
+            # （例如 M21 只是从三行条件里删掉一行），先查 new 会误报残留。
+            continue
+        if n_new > 0:
+            problems.append(
+                f"{m.ident}：源码里**残留着这个变异体**（新体命中 {n_new} 次）"
+                f" —— 上一轮验证被中断后没还原干净"
+            )
+        else:
+            problems.append(
+                f"{m.ident}：锚点在 {m.rel_path} 命中 0 次 —— 变异将无法施加，"
+                f"本项恒为『未证明』（多半是锚点里的参数编号或缩进和代码对不上了）"
+            )
+    return problems
+
 
 DATABASE_URL = os.environ.get(
     "DATABASE_URL", "postgres://itiao:itiao@localhost:5432/itiao?sslmode=disable"
@@ -191,6 +312,305 @@ MUTATIONS: list[Mutation] = [
         why="(2147483647-1)*100 溢出成 -200，负 OFFSET 送进 PostgreSQL 会让整条查询报错 —— "
         "表现为「翻到很后面时接口开始 500」",
     ),
+
+    # ---- 限流（2026-10-03）----
+    #
+    # 限流的失败形态特别隐蔽：改坏了**不会报错**，接口照常工作，
+    # 只是完全不受保护。所以每条守卫都必须能抓住对应的"静默失效"。
+    Mutation(
+        ident="M14 滑动窗口退回固定窗口（只按当前桶计数）",
+        rel_path="services/api/internal/ratelimit/ratelimit.go",
+        old="redis.call('ZREMRANGEBYSCORE', key, '-inf', now - window)",
+        new="redis.call('ZREMRANGEBYSCORE', key, '-inf', now - window)\nredis.call('DEL', key)",
+        expect_fail=[
+            "TestAllow_RejectsBoundaryBurst",
+            "TestAllow_ConcurrentExactlyHitsLimit",
+        ],
+        why="删掉记录等于每次都从空集开始 —— 限流器变成永放行，且不产生任何错误。"
+        "实测：把计数清空后并发用例放行了 60 次（阈值 20）",
+        note="这是固定窗口最极端的一种实现（记在固定桶里但每轮清空）。"
+        "真实实现会保留当前桶的数据，但后果完全一样：限额被架空",
+    ),
+    Mutation(
+        ident="M15 被拒的请求也占额度",
+        rel_path="services/api/internal/ratelimit/ratelimit.go",
+        old="if count >= limit then",
+        new="if count >= 999999 then",
+        expect_fail=["TestAllow_RejectedRequestsDoNotConsumeQuota"],
+        why="攻击者用远超阈值的请求量把窗口塞满，正常用户被一起挤掉 —— "
+        "而他自己的重试在帮倒忙",
+    ),
+    Mutation(
+        ident="M16 限流键丢掉 action 段（不同接口共用一个桶）",
+        rel_path="services/api/internal/ratelimit/ratelimit.go",
+        old='return l.prefix + ":" + string(p.Scope) + ":" + string(p.Action) + ":" + subject',
+        new='return l.prefix + ":" + string(p.Scope) + ":" + subject',
+        expect_fail=[
+            "TestAllow_IsolatesActions",
+            "TestRatePolicy_LoginEntriesAreIndependent",
+        ],
+        why="三个登录入口的 scope 都是 auth。丢掉 action 段之后它们共用一个额度 —— "
+        "撞商户登录就能把管理员登录一起锁死，而那是平台运营停摆的起点",
+        note="最初这条变异改的是 **scope** 段，想证明「scope 该不该进 key」。"
+        "但那是个伪命题：action 已唯一决定 scope，scope 段是冗余的，"
+        "去掉它不改变任何行为。真正不能丢的是 action 段。\n"
+        "顺带一个真实教训：这条变异曾因上次运行被 SIGTERM 打断而**残留**在源码里，"
+        "导致我一度以为「代码漏了 scope 段」而去改实现。方向搞反时，"
+        "先问『这条变异在证明什么我同意吗』，再动代码。",
+    ),
+    Mutation(
+        ident="M17 fail-closed 判断写反（后端故障时反而放行）",
+        rel_path="services/api/internal/ratelimit/ratelimit.go",
+        old="if errors.Is(err, ErrBackendUnavailable) && l.failsClosed {",
+        new="if errors.Is(err, ErrBackendUnavailable) && !l.failsClosed {",
+        expect_fail=["TestDecide_BackendDown", "TestRateLimitGate_BackendDownFailsClosedAs503"],
+        why="生产环境里 Redis 一抖动就静默变成放行 —— 限流失效与「没人触发限流」"
+        "在监控上完全一样",
+        note="两个断言方向相反（一个要求放行一个要求拒绝），所以任何一种写反都会被抓住",
+    ),
+    Mutation(
+        ident="M18 限流专用客户端的 ReadTimeout 不再跟随判定超时",
+        rel_path="services/api/internal/ratelimit/ratelimit.go",
+        old="\t\tDialTimeout:  timeout,\n\t\tReadTimeout:  timeout,\n\t\tWriteTimeout: timeout,",
+        new="\t\tDialTimeout:  5 * time.Second,\n\t\tReadTimeout:  5 * time.Second,\n\t\tWriteTimeout: 5 * time.Second,\n\t\t_ = timeout,",
+        expect_fail=["TestAllow_HasItsOwnTimeout"],
+        why="go-redis 的 ctx deadline 拦不住阻塞中的 socket 读 —— 实测 200ms 的 ctx "
+        "实际耗 5.0009s，等的是客户端自己的 ReadTimeout。把它写死成 5s 之后，"
+        "Redis 主从切换期间的每个请求都会被限流器拖满 5 秒："
+        "准入控制反而成了全站最大的一笔延迟",
+        note="锚点必须在测试**真正读到**的代码上。最初这条变异改的是 "
+        "cmd/api/main.go（把专用客户端换成共用的 rdb）—— 而 main.go 不被任何 "
+        "Go 测试覆盖，那样的变异体恒为『未证明』，是典型的假验证。\n"
+        "另注：`_ = timeout` 必须在 struct 字面量**外面**。写进字面量里会变成"
+        "`_ = timeout: 5*time.Second` 这类语法错误 —— 那证明的是「文件坏了」，"
+        "不是「守卫有牙」（这个坑实测踩过一次）。",
+    ),
+    Mutation(
+        ident="M19 限流后端地址随错误外泄",
+        rel_path="services/api/internal/ratelimit/ratelimit.go",
+        old='return Result{}, fmt.Errorf("%w: %v", ErrBackendUnavailable, err)',
+        new="return Result{}, fmt.Errorf(\"限流后端异常: %v\", err)",
+        expect_fail=["TestAllow_DoesNotLeakBackendAddress"],
+        why="错误原文形如 dial tcp 10.0.3.11:6379，含内网地址与拓扑 —— "
+        "外泄等于给攻击者画地图",
+        note="这一条同时拆掉了哨兵错误包装，于是 errors.Is 判定失效。"
+        "所以它会连带让 fail-closed 失效 —— 两个后果都是真回归，"
+        "两个守卫都该报红",
+    ),
+
+    # ---- refresh 轮换原子性（2026-10-03）----
+    Mutation(
+        ident="M20 DB 的轮换 CAS 去掉 status 条件（退化为先查后写）",
+        rel_path="services/api/internal/repo/refresh_tokens.sql.go",
+        old="WHERE token_hash = $1\n  AND status = 'ACTIVE'\n  AND expires_at > now()",
+        new="WHERE token_hash = $1\n  AND expires_at > now()",
+        expect_fail=["TestRefresh_ConcurrentOnlyOneSucceeds"],
+        why="这是整套 refresh 设计的权威裁决点。去掉 status 条件后，"
+        "两个并发刷新都能把同一条标成 ROTATED，签出两批有效新 token —— "
+        "用户在 App 里遇到「刚刷新成功，下一次刷新又说令牌无效」",
+        note="改的是 sqlc 生成文件里的 SQL 文本：这里要验的是 SQL 语义，"
+        "不是生成器本身，所以不必为变异跑一次 codegen",
+    ),
+    Mutation(
+        ident="M21 DB 轮换 CAS 去掉过期条件",
+        rel_path="services/api/internal/repo/refresh_tokens.sql.go",
+        old="WHERE token_hash = $1\n  AND status = 'ACTIVE'\n  AND expires_at > now()",
+        new="WHERE token_hash = $1\n  AND status = 'ACTIVE'",
+        expect_fail=["TestRefresh_ExpiredTokenRejectedWithoutFamilyRevoke"],
+        why="过期令牌仍能换到新的 access token，等于令牌有效期形同虚设",
+    ),
+    Mutation(
+        ident="M22 库里改存 refresh token 明文",
+        rel_path="services/api/internal/service/token.go",
+        old="\t\t\tTokenHash: hash,\n\t\t\tRole:      user.Role,\n\t\t\tExpiresAt: pgtypeTimestamptz(time.Now().Add(s.RefreshTTL)),\n\t\t}); err != nil {\n\t\t\treturn fmt.Errorf(\"写入 refresh 记录失败: %w\", err)",
+        new="\t\t\tTokenHash: refreshToken,\n\t\t\tRole:      user.Role,\n\t\t\tExpiresAt: pgtypeTimestamptz(time.Now().Add(s.RefreshTTL)),\n\t\t}); err != nil {\n\t\t\treturn fmt.Errorf(\"写入 refresh 记录失败: %w\", err)",
+        expect_fail=["TestRefresh_DatabaseStoresHashNotPlaintext"],
+        why="refresh token 是持有即等同凭证的东西。库被读走（备份泄露、注入读表、"
+        "日志里有人打了 select *）时，存明文等于所有在线用户的会话同时失窃",
+        note="锚点必须带上 `hash` 变量的**全部使用点**。只改 "
+        "`TokenHash: hash,` 这一行的话，hash 变成 declared and not used，"
+        "整个包编译不过 —— 退出码确实非 0，但那是「文件坏了」不是「守卫有牙」",
+    ),
+    Mutation(
+        ident="M23 Redis 消费成功但 DB CAS 失败时不回滚",
+        rel_path="services/api/internal/service/token.go",
+        old="if redisConsumed {\n\t\t\tif rerr := s.RefreshStore.Compensate(",
+        new="if false {\n\t\t\tif rerr := s.RefreshStore.Compensate(",
+        expect_fail=["TestRefresh_ConcurrentOnlyOneSucceeds"],
+        why="不回滚会留下一条「库里查无此会话、却能换到 access token」的凭证 —— "
+        "它能换到 token（签发不查库），于是出现最难查的一类不一致",
+    ),
+    Mutation(
+        ident="M24 刷新时不先查权威侧（只信 Redis）",
+        rel_path="services/api/internal/service/token.go",
+        old='\tif err != nil {\n\t\tif errors.Is(err, pgx.ErrNoRows) {\n\t\t\t// 库里都没有',
+        new='\tif err != nil {\n\t\tif true {\n\t\t\t// 库里都没有',
+        expect_fail=["TestRefresh_DatabaseOverridesRedisGhost", "TestRefresh_RejectsUnknownToken"],
+        why="Redis 说了不算，库说了才算。删掉 ErrNoRows 分支后，"
+        "库里不存在的 token 也会被放行 —— 一条「缓存里有、库里没有」的幽灵记录"
+        "就能换到 access token",
+    ),
+
+    # ---- 商品管理（task 13）----
+    Mutation(
+        ident="M25 商户侧商品查询漏掉 merchant_id 条件（跨租户越权）",
+        rel_path="services/api/internal/repo/merchant_products.sql.go",
+        old="LEFT JOIN skus s ON s.product_id = p.id\nWHERE p.merchant_id = $1::uuid\n  AND ($2::text IS NULL OR p.status = $2::text)",
+        new="LEFT JOIN skus s ON s.product_id = p.id\nWHERE ($2::text IS NULL OR p.status = $2::text)",
+        expect_fail=["TestMerchantProduct_CrossTenantIsolation"],
+        why="漏掉这个条件，商户的商品列表就变成全平台商品列表 —— "
+        "而 200 响应对越权没有任何异常特征，客户端完全看不出来",
+    ),
+    Mutation(
+        ident="M26 商品审核丢掉 CAS 条件",
+        rel_path="services/api/internal/repo/merchant_products.sql.go",
+        old="AND (\n        -- 通过 / 驳回：只有待审的能被裁决\n        ($1::text IN ('ON_SALE', 'REJECTED') AND status = 'PENDING_REVIEW')",
+        new="AND ( true OR\n        ($1::text IN ('ON_SALE', 'REJECTED'))",
+        expect_fail=["TestReviewProduct_ConcurrentOnlyOneWins"],
+        why="两个管理员并发裁决时后者覆盖前者，最终状态取决于谁的网络快，"
+        "而日志里两条都写着「成功」",
+    ),
+    Mutation(
+        ident="M27 状态机长出 DRAFT → ON_SALE 的捷径",
+        rel_path="services/api/internal/domain/product.go",
+        old="ProductDraft:         {ProductPendingReview, ProductOffSale},",
+        new="ProductDraft:         {ProductPendingReview, ProductOffSale, ProductOnSale},",
+        expect_fail=[
+            "TestProductStateMachine_Exhaustive",
+            "TestProductStateMachine_NoDraftToOnSale",
+        ],
+        why="商户可以自己把商品变成在售 —— 这条捷径让整个商品审核形同虚设",
+    ),
+    Mutation(
+        ident="M28 在售商品也允许编辑（改完仍在售）",
+        rel_path="services/api/internal/domain/product.go",
+        old="\treturn s == ProductDraft || s == ProductRejected",
+        new="\treturn true",
+        expect_fail=["TestUpdateProduct_RejectsNonEditableStates"],
+        why="在售商品改标题会造成「下单时看到 A、付款后看到 B」；"
+        "改价格则完全绕过了平台审核",
+    ),
+    Mutation(
+        ident="M29 被驳回后编辑不重新提交（驳回可被绕过）",
+        rel_path="services/api/internal/repo/merchant_products.sql.go",
+        old="WHEN status = 'REJECTED'      THEN 'PENDING_REVIEW'",
+        new="WHEN status = 'REJECTED'      THEN 'REJECTED'",
+        expect_fail=["TestUpdateProduct_RejectedResubmits"],
+        why="商户改完仍是 REJECTED —— 驳回变得没有意义，"
+        "而他要卖货只能反复走「提交→被驳回」的循环",
+    ),
+    Mutation(
+        ident="M30 删除条件放开到在售商品",
+        rel_path="services/api/internal/repo/merchant_products.sql.go",
+        old="WHERE id = $1::uuid\n  AND merchant_id = $2::uuid\n  AND status IN ('DRAFT', 'REJECTED')",
+        new="WHERE id = $1::uuid\n  AND merchant_id = $2::uuid\n  AND status <> 'PENDING_REVIEW'",
+        expect_fail=["TestDeleteProduct_RejectsOnSale"],
+        why="在售商品有历史订单引用其 SKU。删掉会让那些订单的明细失去归属",
+    ),
+
+    # ---- 安全加固（2026-10-10）----
+    #
+    # 这一批的共同特征：**改坏了服务照样跑，接口照样正常**。
+    # 生产环境跑 mock 支付不会让任何一条业务测试变红；
+    # 少发一个安全响应头，浏览器之外没人会察觉；
+    # 去掉请求体上限，功能测试全绿而内存可以被无线撑大。
+    # 所以每条都必须有指定测试兜住，否则就是"看起来加固了"。
+    Mutation(
+        ident="M31 生产环境不再拦住 mock provider（后门重新敞开）",
+        rel_path="services/api/internal/config/config.go",
+        old="\tif err := c.validateMockProviders(); err != nil {\n\t\treturn err\n\t}\n",
+        new="\t_ = c.validateMockProviders()\n",
+        expect_fail=["TestValidate_MockProvidersRejectedInProd"],
+        why="校验还在、也还在被调用，只是错误被丢弃 —— 这是最隐蔽的一种「加固失效」。"
+        "生产环境跑 mock 支付时，/api/v1/pay/mock/notify 是公开路由且不验签，"
+        "任何人 POST 一个订单号就能白拿商品",
+        note="变异体保留调用（`_ = ...`）而不是删掉，是为了让编译照常通过 —— "
+        "删掉的话会变成 unused function，证明的是「文件坏了」",
+    ),
+    Mutation(
+        ident="M32 逃生门判断写反（显式关闭反而放行）",
+        rel_path="services/api/internal/config/config.go",
+        old="\tif c.AllowMockProvidersInProd {\n\t\treturn nil\n\t}",
+        new="\tif !c.AllowMockProvidersInProd {\n\t\treturn nil\n\t}",
+        expect_fail=["TestValidate_MockProvidersRejectedInProd"],
+        why="反转之后语义变成「没设逃生门就放行、设了才检查」—— 正好把默认行为"
+        "从 fail-closed 翻成 fail-open。两个方向都有断言，所以怎么翻都会被抓",
+    ),
+    Mutation(
+        ident="M33 安全响应头不再强制覆盖",
+        rel_path="services/api/internal/httpapi/hardening.go",
+        old="\t\tnext.ServeHTTP(&enforcingWriter{ResponseWriter: w}, r)",
+        new="\t\tnext.ServeHTTP(w, r)",
+        expect_fail=[
+            "TestSecurityHeaders_OverwriteInsteadOfAppend",
+            "TestSecurityHeaders_NoExplicitWriteHeader",
+        ],
+        why="改回「只在 next 之前 Set」之后，下游任何一次同名写入都能覆盖掉安全头，"
+        "而响应看上去完全正常 —— 加固变成声明，声明无法被验证就等于没有",
+        note="这条变异体有个隐蔽之处：头仍然会出现在**绝大多数**响应里，"
+        "只有「下游写同名头」和「handler 直接 Write 不调 WriteHeader」两条路径会漏。"
+        "专项断言必须覆盖这两条，否则守卫会在绿着的情况下放过它",
+    ),
+    Mutation(
+        ident="M34 请求体上限不再做 Content-Length 预检",
+        rel_path="services/api/internal/httpapi/hardening.go",
+        old="\t\t\tif expectsBody(r.Method) {",
+        new="\t\t\tif false && expectsBody(r.Method) {",
+        expect_fail=[
+            "TestBodyLimit_RejectsOversizedBeforeReading",
+            "TestBodyLimit_RejectsUnknownLength",
+        ],
+        why="只剩 MaxBytesReader 兜底之后，超限请求要**先被读进内存**才发现超限。"
+        "安全目标（不 OOM）还在，但带宽与 CPU 被白烧，而且状态码从 413 退化成 400",
+    ),
+    Mutation(
+        ident="M35 请求体上限的边界写成 >=（正好等于上限被拒）",
+        rel_path="services/api/internal/httpapi/hardening.go",
+        old="\t\t\t\tif r.ContentLength > maxBytes {",
+        new="\t\t\t\tif r.ContentLength >= maxBytes {",
+        expect_fail=["TestBodyLimit_ExactLimitPasses"],
+        why="差一错误：恰好 1 MiB 的合法请求被挡掉。只有「超限」和「正常」"
+        "两条断言时抓不到它 —— 必须有「恰好等于上限」这一条",
+    ),
+    Mutation(
+        ident="M36 长度校验漏掉 PUT/PATCH（只检查 POST）",
+        rel_path="services/api/internal/httpapi/hardening.go",
+        old="\tcase http.MethodPost, http.MethodPut, http.MethodPatch:\n\t\treturn true",
+        new="\tcase http.MethodPost:\n\t\treturn true",
+        expect_fail=[
+            "TestBodyLimit_CoversEveryBodyMethod",
+            "TestBodyLimit_UnknownLengthCoveredForEveryBodyMethod",
+        ],
+        why="更新商品走的是 PUT。漏掉它意味着「超限 body 在更新接口上不受预检保护」——"
+        "而这条路径上没有任何其他测试会覆盖到，功能测试也全绿",
+        note="这条变异体换过一次方向，记下来当教训。最初写的是「白名单扩大到 GET」，"
+        "假想的危害是误伤正常浏览请求 —— 但实测发现扩大之后行为**完全不变**"
+        "（GET 的 ContentLength 是 0，两个检查都不触发），所以那个变异体恒为未证明。"
+        "写变异体之前先问「它描述的后果真的会发生吗」，否则会得到一个占着位置的假条目。",
+    ),
+    Mutation(
+        ident="M37 封面地址改用黑名单（只禁 javascript:）",
+        rel_path="services/api/internal/service/product.go",
+        old='\tswitch strings.ToLower(u.Scheme) {\n\tcase "http", "https":\n\tdefault:',
+        new='\tswitch strings.ToLower(u.Scheme) {\n\tcase "javascript", "vbscript":',
+        expect_fail=["TestValidateCoverURL"],
+        why="黑名单永远追不上变体：data: 内联文档、file: 本地文件、"
+        "以及协议相对 URL（//evil.com/x）都会从 default 掉出去而被放行。"
+        "白名单只有两个值，穷举得完也就关得死",
+        note="变异后的 switch 只剩一个 case，其余值直接穿过 —— 这是黑名单写法的"
+        "典型形态（「只挡我知道的那几个」）。它能编译、能通过一般用例，"
+        "只在 data:/file:/协议相对这几条上失守",
+    ),
+    Mutation(
+        ident="M38 封面地址不校验主机名",
+        rel_path="services/api/internal/service/product.go",
+        old='\tif u.Host == "" {',
+        new='\tif false && u.Host == "" {',
+        expect_fail=["TestValidateCoverURL"],
+        why='"http:///x.png" 能通过 scheme 白名单但没有主机名，落到前端就是一个'
+        "永远加载失败的图。商户在真机上看到白框，然后回来问「为什么图片不显示」——"
+        "这类问题的排查成本远高于在这里挡一下",
+    ),
 ]
 
 
@@ -200,13 +620,17 @@ def sha256(data: bytes) -> str:
 
 def go_test(packages: str) -> tuple[int, set[str], str]:
     """跑测试，返回 (退出码, 失败的测试全名集合, 原始输出)。"""
-    proc = subprocess.run(
-        ["go", "test", "-count=1", "-json", packages],
-        cwd=API_DIR,
-        capture_output=True,
-        text=True,
-        env={**os.environ, "DATABASE_URL": DATABASE_URL},
-    )
+    try:
+        proc = subprocess.run(
+            ["go", "test", "-count=1", "-json", *packages.split()],
+            cwd=API_DIR,
+            capture_output=True,
+            text=True,
+            timeout=GO_TEST_TIMEOUT,
+            env={**os.environ, "DATABASE_URL": DATABASE_URL},
+        )
+    except subprocess.TimeoutExpired:
+        return 124, set(), f"go test 超过 {GO_TEST_TIMEOUT}s 未结束（判定为卡住，不算证明）"
 
     failed: set[str] = set()
     plain: list[str] = []
@@ -243,9 +667,18 @@ def run_mutation(m: Mutation) -> tuple[bool, str]:
 
     path.write_bytes(text.replace(m.old, m.new, 1).encode("utf-8"))
 
+    # 关键：把「当前正在被改的文件」登记到全局，任何退出路径都会还原它。
+    #
+    # 为什么不能只靠 try/finally：SIGTERM（超时、被 Ctrl-C、CI 取消）默认**直接杀进程**，
+    # 不跑 Python 的 finally、不跑atexit。实测踩过 —— 跑到 M5 时被 SIGTERM 打断，
+    # 结果 CAS 条件 `AND status = 'PENDING'` 永久留在了 repo/merchant.sql.go 里，
+    # 之后所有测试都变红，而凶手（变异体）本身已经不在脚本的视野内。
+    # 一个"改坏源码"的脚本必须能在被杀之后自我修复，否则它就是个投毒器。
+    ACTIVE.append((path, m.original))
     try:
-        code, failed, raw = go_test("./internal/...")
+        code, failed, raw = go_test(PACKAGES)
     finally:
+        ACTIVE.pop()
         path.write_bytes(m.original)
         after_hash = sha256(path.read_bytes())
         if after_hash != before_hash:
@@ -268,37 +701,118 @@ def run_mutation(m: Mutation) -> tuple[bool, str]:
     return True, f"被 {', '.join(caught)} 抓住"
 
 
-def main() -> int:
-    print("=" * 78)
-    print("变异验证：权限 / 入驻审核 守卫")
-    print("=" * 78)
+def parse_mut_index(ident: str) -> int | None:
+    head = ident.split(" ", 1)[0]
+    if head.startswith("M") and head[1:].isdigit():
+        return int(head[1:])
+    return None
 
-    baseline_code, _, baseline_raw = go_test("./internal/...")
-    if baseline_code != 0:
-        print("基线不通过 —— 先让测试全绿再来验守卫。")
-        print(baseline_raw)
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="变异验证：证明守卫真的有牙")
+    ap.add_argument("--from", dest="lo", type=int, default=None, help="只跑编号 >= N 的变异体")
+    ap.add_argument("--to", dest="hi", type=int, default=None, help="只跑编号 <= N 的变异体")
+    ap.add_argument(
+        "--no-baseline",
+        action="store_true",
+        help="跳过基线全量测试（分批续跑时用，省一次 221 测试的等待）",
+    )
+    ap.add_argument(
+        "--audit",
+        action="store_true",
+        help="只做残留自检：检查源码里是否还留着上一轮没还原干净的变异体",
+    )
+    ap.add_argument(
+        "--packages",
+        default="./internal/...",
+        help="go test 的包路径（默认全量）。环境不完整时可收窄，"
+        "例如 PG/Redis 没起时先验不依赖它们的那些变异体",
+    )
+    args = ap.parse_args()
+
+    # run_mutation 读的是模块级 PACKAGES，这里改它。
+    global PACKAGES
+    PACKAGES = args.packages
+
+    _install_signal_guards()
+
+    if args.audit:
+        problems = audit_clean()
+        if problems:
+            print("残留自检**未通过**：")
+            for p in problems:
+                print(f"  - {p}")
+            print(
+                "\n这些必须先手工修好（或从 git 恢复对应文件）再跑验证。\n"
+                "带着污染跑出来的任何结论都不可信 —— 基线会红，而红的原因"
+                "看起来像测试的问题，不是源码被改坏。"
+            )
+            return 2
+        print(f"残留自检通过：{len(MUTATIONS)} 条变异体全部处于原始状态，锚点均唯一命中。")
+        return 0
+
+    selected = []
+    for m in MUTATIONS:
+        idx = parse_mut_index(m.ident)
+        if idx is None:
+            selected.append(m)
+            continue
+        if args.lo is not None and idx < args.lo:
+            continue
+        if args.hi is not None and idx > args.hi:
+            continue
+        selected.append(m)
+
+    if not selected:
+        print("没有匹配的变异体。")
         return 2
-    print("基线：./internal/... 全部通过\n")
+
+    print("=" * 78)
+    print(f"变异验证：{selected[0].ident.split(' ', 1)[0]}–"
+          f"{selected[-1].ident.split(' ', 1)[0]}，共 {len(selected)} 条")
+    print("=" * 78, flush=True)
+
+    if args.no_baseline:
+        print("已跳过基线（--no-baseline）\n", flush=True)
+    else:
+        # 基线之前先自检。顺序不能反：带着残留变异体跑出来的"基线红"会被
+        # 误读成"新写的测试有问题"，而真凶在测试输出里永远不出现。
+        problems = audit_clean()
+        if problems:
+            print("残留自检**未通过**，拒绝开跑：")
+            for p in problems:
+                print(f"  - {p}")
+            return 2
+        print(f"残留自检通过（{len(MUTATIONS)} 条变异体均为原始状态）", flush=True)
+
+        baseline_code, _, baseline_raw = go_test(PACKAGES)
+        if baseline_code != 0:
+            print("基线不通过 —— 先让测试全绿再来验守卫。")
+            print(baseline_raw)
+            return 2
+        print("基线：./internal/... 全部通过\n", flush=True)
 
     proven, unproven = 0, 0
-    for m in MUTATIONS:
-        print(f"[{m.ident}]")
-        print(f"  改坏：{m.rel_path}")
-        print(f"  理由：{m.why}")
-        if m.note:
-            print(f"  说明：{m.note}")
+    unproven_list: list[str] = []
+    for i, m in enumerate(selected, 1):
+        tag = m.ident.split(" ", 1)[0]
+        print(f"[{i}/{len(selected)}] {m.ident}", flush=True)
+        print(f"  改坏：{m.rel_path}", flush=True)
         ok, detail = run_mutation(m)
-        print(f"  -> {'✅ 抓住' if ok else '❌ 未证明'}：{detail}\n")
+        print(f"  -> {'✅ 抓住' if ok else '❌ 未证明'}：{detail}\n", flush=True)
         if ok:
             proven += 1
         else:
             unproven += 1
+            unproven_list.append(f"{tag} {m.ident}")
 
     print("=" * 78)
-    print(f"结果：{proven}/{len(MUTATIONS)} 个变异被**指定测试**抓住")
+    print(f"结果：{proven}/{len(selected)} 个变异被**指定测试**抓住")
+    for line in unproven_list:
+        print(f"      未证明：{line}")
     if unproven:
         print(f"      {unproven} 个未证明 —— 这些守卫目前是无牙的，别当成已有保护")
-    print("=" * 78)
+    print("=" * 78, flush=True)
     return 0 if unproven == 0 else 1
 
 

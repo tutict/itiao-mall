@@ -13,6 +13,15 @@
 SELECT status FROM merchant_profiles WHERE user_id = sqlc.arg('user_id')::uuid;
 
 -- ============ 入驻资料 ============
+
+-- 审核员在商品审核队列里要靠店名对上号。没有它，一个混着几十家店商品的
+-- 列表就只能靠 merchant_id 去别处查 —— 而那要多一次跳转。
+--
+-- 单独一条查询而不是复用 GetMerchantProfile：后者 JOIN 了 users 并返回
+-- 十余个字段，这里只要一个名字。少查的字段不是优化，是避免把
+-- 「商户的手机号」这类字段带进一个只需要店名的调用链。
+-- name: GetMerchantShopName :one
+SELECT shop_name FROM merchant_profiles WHERE user_id = sqlc.arg('user_id')::uuid;
 -- name: GetMerchantProfile :one
 SELECT
     mp.user_id,

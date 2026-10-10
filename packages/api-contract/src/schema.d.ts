@@ -389,6 +389,210 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/merchant/products": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 我的商品列表（含全部状态）
+         * @description 与用户端的 `GET /api/v1/products` 的区别是**不过滤状态** ——
+         *     商户需要看到自己的草稿、待审、被驳回的商品，用户端只看得到 `ON_SALE`。
+         *
+         *     跨租户隔离靠服务端每条 SQL 都带 `merchant_id` 条件实现，不靠参数校验：
+         *     少一个条件就是全平台商品列表，而 200 响应对越权没有任何异常特征。
+         */
+        get: operations["listMerchantProducts"];
+        put?: never;
+        /**
+         * 新建商品（草稿）
+         * @description 新建出来一定是 `DRAFT` —— 商品**不能**由商户直接置为在售，
+         *     必须经平台审核（`DRAFT → PENDING_REVIEW → ON_SALE`）。
+         *     加一条捷径就等于把商品审核架空。
+         */
+        post: operations["createMerchantProduct"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/merchant/products/{productId}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                productId: components["parameters"]["ProductId"];
+            };
+            cookie?: never;
+        };
+        /** 商品详情（含 SKU） */
+        get: operations["getMerchantProduct"];
+        /**
+         * 编辑商品
+         * @description 只能编辑 `DRAFT` 与 `REJECTED`。状态流转：
+         *     - `DRAFT`：改完仍是草稿；
+         *     - `REJECTED`：改完**自动重新提交**（→ `PENDING_REVIEW`）并清空驳回理由 ——
+         *       不给"原样再提交"留路，否则驳回就没有意义。
+         *
+         *     在售商品请先 `POST .../off-shelf` 下架：下架后编辑会让它回到 `DRAFT`，
+         *     改完需重新提交审核才能再上架。不允许"改完仍在售"。
+         */
+        put: operations["updateMerchantProduct"];
+        post?: never;
+        /**
+         * 删除商品（仅草稿 / 被驳回）
+         * @description 在售商品删不掉，它有历史订单引用其 SKU。从架上消失用下架表达。
+         */
+        delete: operations["deleteMerchantProduct"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/merchant/products/{productId}/submit": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 提交审核（草稿 → 待审） */
+        post: operations["submitMerchantProduct"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/merchant/products/{productId}/withdraw": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 撤回审核（待审 → 草稿）
+         * @description 提交完发现填错了要改。没有这条边的话商户只能等审核员驳回，
+         *     而审核员可能几小时后才看。
+         */
+        post: operations["withdrawMerchantProduct"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/merchant/products/{productId}/off-shelf": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 下架（在售 → 已下架） */
+        post: operations["offShelfMerchantProduct"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/merchant/products/{productId}/on-shelf": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 上架（已下架 → 在售）
+         * @description 刻意**不要求**重新审核：这条边上的商品已经审过一次。
+         *     没有这条边的话，商户改个价就要等审核，平台会被审核量压垮。
+         */
+        post: operations["onShelfMerchantProduct"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/admin/products": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 商品审核队列
+         * @description 按提交时间倒序：最早的申请排最前。否则新申请会插到队尾，
+         *     而审核员要处理的是"等得最久"的那批。
+         */
+        get: operations["listProductsForReview"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/admin/products/{productId}/review": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 审核商品
+         * @description 三种裁决：
+         *     - `ON_SALE`：通过。只有 `PENDING_REVIEW` 能被裁决。
+         *     - `REJECTED`：驳回，**必须给理由**。只有 `PENDING_REVIEW` 能被裁决。
+         *     - `OFF_SALE`：强制下架。在售与已下架的都能被强制下架 ——
+         *       这是平台的事后处置（违规、投诉），存在的意义就是立刻停止销售。
+         *
+         *     通过与驳回都走 CAS（`WHERE id = ? AND status = 'PENDING_REVIEW'`）：
+         *     两个管理员同时点「通过 / 驳回」时只有一个生效，另一个拿到 404。
+         */
+        post: operations["reviewProduct"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/admin/products/{productId}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 审核视角的商品详情 */
+        get: operations["getProductForReview"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -443,6 +647,94 @@ export interface components {
          * @enum {string}
          */
         MerchantReviewDecision: "APPROVED" | "REJECTED";
+        /**
+         * @description 商品状态机。与 migration 0002 的 `products_status_check` 一一对应。
+         *
+         *     ```
+         *     DRAFT ──提交审核──> PENDING_REVIEW ──通过──> ON_SALE <──上架── OFF_SALE
+         *       │                      │                      │
+         *       └──改资料后重新提交──>  └──驳回──> REJECTED ────┘
+         *     ```
+         *     注意**没有** `DRAFT → ON_SALE` 这条边：上架必须经平台审核。
+         * @enum {string}
+         */
+        ProductStatus: "DRAFT" | "PENDING_REVIEW" | "ON_SALE" | "OFF_SALE" | "REJECTED";
+        /**
+         * @description 商品审核结论：
+         *     - `ON_SALE` 通过（仅 `PENDING_REVIEW` 可裁决）
+         *     - `REJECTED` 驳回（仅 `PENDING_REVIEW` 可裁决，必须给理由）
+         *     - `OFF_SALE` 强制下架（在售与已下架都可，用于违规/投诉的事后处置）
+         * @enum {string}
+         */
+        ProductReviewDecision: "ON_SALE" | "REJECTED" | "OFF_SALE";
+        /**
+         * @description 商品与 SKU 一起提交。SKU 采用**整体替换**语义（编辑时先删后建）——
+         *     增量增删改 SKU 需要额外的 diff 协议，而商品编辑不在热路径上。
+         *     整体替换的代价是 SKU id 会变，因此**已有订单不受影响**：
+         *     下单时已经把标题与单价快照进 `order_items` 了。
+         */
+        MerchantProductRequest: {
+            title: string;
+            description?: string;
+            category?: string;
+            cover_url?: string;
+            skus: components["schemas"]["MerchantSkuRequest"][];
+        };
+        MerchantSkuRequest: {
+            name: string;
+            price_cents: components["schemas"]["Money"];
+            stock: number;
+        };
+        ProductReviewRequest: {
+            decision: components["schemas"]["ProductReviewDecision"];
+            /** @description decision 为 REJECTED 时必填，服务端强制校验。 */
+            reject_reason?: string;
+        };
+        MerchantProduct: {
+            /** Format: uuid */
+            id: string;
+            /** Format: uuid */
+            merchant_id: string;
+            title: string;
+            description?: string;
+            category?: string;
+            cover_url?: string;
+            status: components["schemas"]["ProductStatus"];
+            /** @description 仅 `REJECTED` 时有值。重新提交后清空。 */
+            reject_reason?: string;
+            /** @description 最低 SKU 价，无 SKU 时为 0 */
+            min_price_cents?: components["schemas"]["Money"];
+            /**
+             * Format: int64
+             * @description 所有 SKU 库存之和
+             */
+            total_stock?: number;
+            /** Format: date-time */
+            submitted_at?: string | null;
+            /** Format: date-time */
+            reviewed_at?: string | null;
+            /** Format: date-time */
+            created_at: string;
+            /** Format: date-time */
+            updated_at: string;
+            skus: components["schemas"]["Sku"][];
+        };
+        ReviewProduct: components["schemas"]["MerchantProduct"] & {
+            /** @description 店铺名。审核员要靠它对上号，商户侧不需要所以不重复给。 */
+            shop_name?: string;
+        };
+        MerchantProductPage: {
+            items: components["schemas"]["MerchantProduct"][];
+            total: number;
+            page: number;
+            page_size: number;
+        };
+        ReviewProductPage: {
+            items: components["schemas"]["ReviewProduct"][];
+            total: number;
+            page: number;
+            page_size: number;
+        };
         MerchantProfile: {
             /** Format: uuid */
             user_id: string;
@@ -1171,6 +1463,296 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["MerchantProfile"];
+                };
+            };
+            default: components["responses"]["Problem"];
+        };
+    };
+    listMerchantProducts: {
+        parameters: {
+            query?: {
+                /** @description 不传返回全部 */
+                status?: components["schemas"]["ProductStatus"];
+                page?: number;
+                page_size?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 商品分页 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MerchantProductPage"];
+                };
+            };
+            default: components["responses"]["Problem"];
+        };
+    };
+    createMerchantProduct: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MerchantProductRequest"];
+            };
+        };
+        responses: {
+            /** @description 创建后的商品 */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MerchantProduct"];
+                };
+            };
+            default: components["responses"]["Problem"];
+        };
+    };
+    getMerchantProduct: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                productId: components["parameters"]["ProductId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 商品详情 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MerchantProduct"];
+                };
+            };
+            default: components["responses"]["Problem"];
+        };
+    };
+    updateMerchantProduct: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                productId: components["parameters"]["ProductId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MerchantProductRequest"];
+            };
+        };
+        responses: {
+            /** @description 更新后的商品 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MerchantProduct"];
+                };
+            };
+            default: components["responses"]["Problem"];
+        };
+    };
+    deleteMerchantProduct: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                productId: components["parameters"]["ProductId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 已删除 */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            default: components["responses"]["Problem"];
+        };
+    };
+    submitMerchantProduct: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                productId: components["parameters"]["ProductId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 提交后的商品 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MerchantProduct"];
+                };
+            };
+            default: components["responses"]["Problem"];
+        };
+    };
+    withdrawMerchantProduct: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                productId: components["parameters"]["ProductId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 撤回后的商品 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MerchantProduct"];
+                };
+            };
+            default: components["responses"]["Problem"];
+        };
+    };
+    offShelfMerchantProduct: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                productId: components["parameters"]["ProductId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 下架后的商品 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MerchantProduct"];
+                };
+            };
+            default: components["responses"]["Problem"];
+        };
+    };
+    onShelfMerchantProduct: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                productId: components["parameters"]["ProductId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 上架后的商品 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MerchantProduct"];
+                };
+            };
+            default: components["responses"]["Problem"];
+        };
+    };
+    listProductsForReview: {
+        parameters: {
+            query?: {
+                /** @description 不传返回全部 */
+                status?: components["schemas"]["ProductStatus"];
+                page?: number;
+                page_size?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 商品分页 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ReviewProductPage"];
+                };
+            };
+            default: components["responses"]["Problem"];
+        };
+    };
+    reviewProduct: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                productId: components["parameters"]["ProductId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ProductReviewRequest"];
+            };
+        };
+        responses: {
+            /** @description 审核后的商品 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ReviewProduct"];
+                };
+            };
+            default: components["responses"]["Problem"];
+        };
+    };
+    getProductForReview: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                productId: components["parameters"]["ProductId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 商品详情 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ReviewProduct"];
                 };
             };
             default: components["responses"]["Problem"];

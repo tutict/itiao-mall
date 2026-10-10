@@ -62,5 +62,20 @@ SELECT * FROM skus WHERE product_id = sqlc.arg('product_id')::uuid ORDER BY pric
 -- name: ListSkusByIDs :many
 SELECT * FROM skus WHERE id = ANY(sqlc.arg('ids')::uuid[]) ORDER BY id;
 
+-- ★ 一次取回一页商品的全部 SKU。
+--
+-- 为什么需要它：商户后台的商品列表一页 20 个，若在 Go 里逐个查
+-- ListSkusByProduct，那是 1 + 20 次往返。这一页每次打开都要走一遍，
+-- 而它恰好是商户最常访问的界面。
+--
+-- 传入的是**已经在应用层确认过归属**的商品 id 列表 ——
+-- 租户隔离由调用它的 ListMerchantProducts 完成（那条 SQL 自带 merchant_id），
+-- 这里不再重复过滤：多一层 merchant_id 不会更安全，只会让两个地方
+-- 各有一份"哪些 id 是允许的"的知识，改一处漏一处就是越权。
+-- name: ListSkusByProductIDs :many
+SELECT * FROM skus
+WHERE product_id = ANY(sqlc.arg('ids')::uuid[])
+ORDER BY product_id, price_cents, id;
+
 -- name: GetSkuByID :one
 SELECT * FROM skus WHERE id = sqlc.arg('id')::uuid LIMIT 1;

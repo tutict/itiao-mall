@@ -91,37 +91,43 @@ func (s *Service) loginWithPassword(ctx context.Context, phone, password, wantRo
 }
 
 // Refresh 轮换 refresh token 并签发新的 access token。
-// 检测到重放时，Rotate 内部会吊销整个 family，这里把错误原样上抛。
-func (s *Service) Refresh(ctx context.Context, refreshToken string) (*Session, error) {
-	newRefresh, rec, _, err := s.RefreshStore.Rotate(ctx, refreshToken)
-	if err != nil {
-		return nil, err
-	}
-
-	user, err := s.Q.GetUserByID(ctx, rec.UserID)
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, domain.ErrRefreshTokenInvalid
-		}
-		return nil, fmt.Errorf("查询用户失败: %w", err)
-	}
-	if err := ensureActive(user); err != nil {
-		return nil, err
-	}
-
-	access, exp, err := s.Issuer.IssueAccess(user.ID, user.Role)
-	if err != nil {
-		return nil, err
-	}
-	return &Session{AccessToken: access, RefreshToken: newRefresh, ExpiresAt: exp, User: user}, nil
-}
+// 完整实现见 token.go —— 权威判定在数据库 CAS，Redis 只做加速与互斥。
 
 // Logout 吊销该 token 所属的整个 family。
+//
+// 两个存储都处理，顺序是「数据库 → Redis」：数据库是权威，先吊它；
+// Redis 失败只记日志。反过来的话，Redis 里已经删了而数据库还留着，
+// 用户会以为登出成功了，实际换个入口（或等缓存过期）又能用。
 func (s *Service) Logout(ctx context.Context, refreshToken string) error {
 	if refreshToken == "" {
 		return nil
 	}
-	return s.RefreshStore.RevokeToken(ctx, refreshToken)
+
+	hash := auth.HashToken(refreshToken)
+
+	// 先在权威侧定位 family。查不到就直接成功返回：
+	// 登出是幂等操作，"这个 token 不存在"与"已经登出了"对调用方无差别。
+	tok, err := s.Q.GetRefreshTokenByHash(ctx, hash)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			// 数据库里没有，但 Redis 里可能有（理论上不该：写库在前）。
+			// 仍尝试吊销 Redis 侧，让登出在两个存储上都成立。
+			if rerr := s.RefreshStore.RevokeToken(ctx, refreshToken); rerr != nil {
+				s.Logger().Warn("登出时吊销 Redis 缓存失败", "err", rerr)
+			}
+			return nil
+		}
+		return fmt.Errorf("查询 refresh 记录失败: %w", err)
+	}
+
+	if _, err := s.Q.RevokeRefreshFamily(ctx, tok.FamilyID); err != nil {
+		return fmt.Errorf("吊销会话失败: %w", err)
+	}
+	if _, err := s.RefreshStore.RevokeFamily(ctx, tok.FamilyID); err != nil {
+		// 数据库已吊销，权威侧安全。Redis 残留会在 TTL 到期后消失。
+		s.Logger().Warn("登出时吊销 Redis 缓存失败（数据库已吊销）", "err", err)
+	}
+	return nil
 }
 
 func (s *Service) GetUser(ctx context.Context, userID string) (repo.User, error) {
@@ -133,18 +139,6 @@ func (s *Service) GetUser(ctx context.Context, userID string) (repo.User, error)
 		return repo.User{}, fmt.Errorf("查询用户失败: %w", err)
 	}
 	return user, nil
-}
-
-func (s *Service) issueSession(ctx context.Context, user repo.User) (*Session, error) {
-	access, exp, err := s.Issuer.IssueAccess(user.ID, user.Role)
-	if err != nil {
-		return nil, err
-	}
-	refresh, err := s.RefreshStore.Issue(ctx, user.ID, user.Role)
-	if err != nil {
-		return nil, err
-	}
-	return &Session{AccessToken: access, RefreshToken: refresh, ExpiresAt: exp, User: user}, nil
 }
 
 // ensureActive 封号用户不允许登录/刷新/下单。

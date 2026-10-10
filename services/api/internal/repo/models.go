@@ -91,6 +91,19 @@ type Product struct {
 	ReviewedAt   pgtype.Timestamptz `json:"reviewed_at"`
 }
 
+type RefreshToken struct {
+	ID        string             `json:"id"`
+	UserID    string             `json:"user_id"`
+	FamilyID  string             `json:"family_id"`
+	TokenHash string             `json:"token_hash"`
+	Role      string             `json:"role"`
+	Status    string             `json:"status"`
+	ExpiresAt pgtype.Timestamptz `json:"expires_at"`
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
+	RotatedAt pgtype.Timestamptz `json:"rotated_at"`
+	RevokedAt pgtype.Timestamptz `json:"revoked_at"`
+}
+
 type Sku struct {
 	ID         string             `json:"id"`
 	ProductID  string             `json:"product_id"`

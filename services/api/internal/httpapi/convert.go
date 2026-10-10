@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"math"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -193,6 +194,107 @@ func toGenMerchantProfile(v *service.MerchantProfileView) gen.MerchantProfile {
 		out.Phone = &v.Phone
 	}
 	return out
+}
+
+// ---- 商户商品 ----
+
+// toGenMerchantProduct 把领域视图翻成契约类型。
+//
+// 空串 → 省略字段，理由与 toGenMerchantProfile 一致：
+// 客户端要能区分「没有值」与「值就是空的」。
+//
+// 注意 MinPriceCents 与 TotalStock 是**指针**：契约把它们声明为 optional
+// （allOf + 没有 required），而"0 元"是一个合法的商品价格 ——
+// 用值类型的话 omitempty 会把 0 抹掉，客户端就分不清"免费"和"没填"。
+func toGenMerchantProduct(v *service.ProductView) gen.MerchantProduct {
+	minPrice := gen.Money(v.MinPriceCents)
+	totalStock := v.TotalStock
+	out := gen.MerchantProduct{
+		Id:            toUUID(v.ID),
+		MerchantId:    toUUID(v.MerchantID),
+		Title:         v.Title,
+		Status:        gen.ProductStatus(v.Status),
+		MinPriceCents: &minPrice,
+		TotalStock:    &totalStock,
+		SubmittedAt:   v.SubmittedAt,
+		ReviewedAt:    v.ReviewedAt,
+		CreatedAt:     v.CreatedAt,
+		UpdatedAt:     v.UpdatedAt,
+		Skus:          toGenSkus(v.Skus),
+	}
+	if v.Description != "" {
+		out.Description = &v.Description
+	}
+	if v.Category != "" {
+		out.Category = &v.Category
+	}
+	if v.CoverURL != "" {
+		out.CoverUrl = &v.CoverURL
+	}
+	if v.RejectReason != "" {
+		out.RejectReason = &v.RejectReason
+	}
+	return out
+}
+
+// toGenReviewProduct 在商户视图之上补一个店铺名。
+// 刻意不复用 toGenMerchantProduct 再补字段：那样要先把结果取出来改，
+// 而 allOf 生成的类型不是同一个类型，没有继承可走。
+func toGenReviewProduct(v *service.ReviewProductView) gen.ReviewProduct {
+	base := toGenMerchantProduct(&v.ProductView)
+	out := gen.ReviewProduct{
+		Id:            base.Id,
+		MerchantId:    base.MerchantId,
+		Title:         base.Title,
+		Description:   base.Description,
+		Category:      base.Category,
+		CoverUrl:      base.CoverUrl,
+		Status:        base.Status,
+		RejectReason:  base.RejectReason,
+		MinPriceCents: base.MinPriceCents,
+		TotalStock:    base.TotalStock,
+		SubmittedAt:   base.SubmittedAt,
+		ReviewedAt:    base.ReviewedAt,
+		CreatedAt:     base.CreatedAt,
+		UpdatedAt:     base.UpdatedAt,
+		Skus:          base.Skus,
+	}
+	if v.ShopName != "" {
+		out.ShopName = &v.ShopName
+	}
+	return out
+}
+
+func toGenSkus(skus []repo.Sku) []gen.Sku {
+	// 刻意回空切片而不是 nil：契约里 skus 是 required，nil 会序列化成 null，
+	// 而客户端的 `skus.map(...)` 会因此炸掉。空数组才是"没有规格"。
+	out := make([]gen.Sku, 0, len(skus))
+	for _, s := range skus {
+		out = append(out, toGenSku(s))
+	}
+	return out
+}
+
+// toServiceProductInput 把契约请求体翻成 service 的输入。
+//
+// 单独抽出来是因为创建与编辑共用它 —— 两个入口的校验规则必须完全一致，
+// 而"两边各写一份 trim"是最容易出现的行为分叉的地方。
+func toServiceProductInput(body *gen.MerchantProductRequest) service.ProductInput {
+	in := service.ProductInput{
+		Title:       strings.TrimSpace(body.Title),
+		Description: strings.TrimSpace(derefStr(body.Description)),
+		Category:    strings.TrimSpace(derefStr(body.Category)),
+		CoverURL:    strings.TrimSpace(derefStr(body.CoverUrl)),
+		Skus:        make([]service.SkuInput, 0, len(body.Skus)),
+	}
+	for _, s := range body.Skus {
+		in.Skus = append(in.Skus, service.SkuInput{
+			Name:       strings.TrimSpace(s.Name),
+			PriceCents: int64(s.PriceCents),
+			Stock:      int32(s.Stock),
+		})
+	}
+	return in
 }
 
 func toGenOrder(v *service.OrderView) gen.Order {

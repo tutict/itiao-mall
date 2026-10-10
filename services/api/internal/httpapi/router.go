@@ -18,6 +18,7 @@ import (
 	"github.com/tutic/itiao-mall/services/api/internal/domain"
 	"github.com/tutic/itiao-mall/services/api/internal/httpapi/gen"
 	"github.com/tutic/itiao-mall/services/api/internal/payment"
+	"github.com/tutic/itiao-mall/services/api/internal/ratelimit"
 	"github.com/tutic/itiao-mall/services/api/internal/repo"
 	"github.com/tutic/itiao-mall/services/api/internal/service"
 )
@@ -32,10 +33,27 @@ type Deps struct {
 	Wechat       auth.WechatExchanger
 	Payment      payment.Provider
 	PendingTTL   time.Duration
+	RefreshTTL   time.Duration
+
+	// Limiter 可为 nil —— 那是"限流整体关闭"的显式表达，
+	// 此时限流中间件被整个跳过（见下方对 nil 的处理）。
+	//
+	// 用 nil 而不是 `Enabled bool` 是为了让"关掉"这件事在类型上无歧义：
+	// 一个 bool 加一个可能为 nil 的实现，迟早出现"Enabled=false 但中间件还在"
+	// 这种半开状态，而半开的限流比没有限流更难排查。
+	Limiter *ratelimit.Limiter
+
+	// RateLimits 是两档阈值。分成"认证"与"读写"两档是因为它们的攻击形态不同：
+	// 认证类防撞库（阈值低、误伤成本高），读写类防刷单与爬取（阈值高、误伤成本低）。
+	RateLimits ratelimit.Defaults
+	AuthLimits ratelimit.Defaults
 
 	// CORS 需要放在 authGate 之前执行，原因见 cors.go 的注释。
 	CORSOrigins    []string
 	CORSAllowLocal bool
+
+	// MaxBodyBytes 是请求体上限。≤0 时用 DefaultMaxBodyBytes。
+	MaxBodyBytes int64
 }
 
 // NewRouter 组装路由与中间件链。
@@ -57,17 +75,37 @@ func NewRouter(d Deps) http.Handler {
 		Payment:      d.Payment,
 		Logger:       d.Logger,
 		PendingTTL:   d.PendingTTL,
+		RefreshTTL:   d.RefreshTTL,
 	})
 
 	table := routePolicy(d.Payment.Name())
 
 	r.Use(RequestID)
+	// 安全响应头放在最外层之一：连 Recoverer 的 500、CORS 的 204 预检响应
+	// 也要带上这些头。越靠前，覆盖面越大。
+	r.Use(SecurityHeaders)
 	r.Use(AccessLog(d.Logger))
 	r.Use(Recoverer)
 	r.Use(chimw.RealIP)
 	r.Use(chimw.Timeout(30 * time.Second))
 	r.Use(CORS(CORSConfig{AllowedOrigins: d.CORSOrigins, AllowLocalhost: d.CORSAllowLocal}))
 	r.Use(authGate(d.Issuer, d.Payment.Name()))
+	// 限流必须在 authGate **之后**：它要读 authGate 放进 context 的 claims 来选
+	// 限流主体（已登录按 user id，匿名按 IP）。放在前面所有请求都只能按 IP 限，
+	// 同一 NAT 后的正常用户会互相挤兑。
+	//
+	// 又必须在 merchantStatusGate **之前**：限流是准入控制，被拒的请求
+	// 不该再消耗一次数据库查询 —— 而连接池正是限流风暴时最紧张的资源。
+	if d.Limiter != nil {
+		r.Use(rateLimitGate(d.Limiter, ratePolicy(d.AuthLimits), d.RateLimits))
+	}
+	// 请求体上限排在限流**之后**：超大 body 的请求应当先被计入限流统计。
+	// 排到前面的话，攻击者只要把 Content-Length 写超限，就能在不触发任何
+	// 限流计数的情况下持续打目标 —— 一个白送的绕过。
+	//
+	// 又必须排在 handler **之前**：oapi-codegen 的解码是
+	// `json.NewDecoder(r.Body).Decode(...)`，会把 body 整个读进内存。
+	r.Use(BodyLimit(d.MaxBodyBytes))
 	// 必须排在 authGate **之后**：它要读 authGate 放进 context 的 claims。
 	r.Use(merchantStatusGate(table, svc.MerchantStatus))
 

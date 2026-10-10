@@ -20,6 +20,7 @@ import (
 	"github.com/tutic/itiao-mall/services/api/internal/platform/logging"
 	"github.com/tutic/itiao-mall/services/api/internal/platform/migrate"
 	"github.com/tutic/itiao-mall/services/api/internal/platform/postgres"
+	"github.com/tutic/itiao-mall/services/api/internal/ratelimit"
 )
 
 const usage = `itiao-mall API
@@ -115,6 +116,36 @@ func runServe(cfg *config.Config, logger *slog.Logger) error {
 	issuer := auth.NewTokenIssuer(cfg.JWTSecret, cfg.AccessTTL)
 	refreshStore := auth.NewRefreshStore(rdb, cfg.RefreshTTL)
 
+	// 限流器。nil 表示整体关闭（配置显式关掉时）。
+	//
+	// 关闭的判定刻意放在这里而不是 NewRouter 内部：限流器需要一个 Redis 客户端，
+	// 而 NewRouter 的 Deps 里已经有 Redis —— 但把"要不要建"这个决定
+	// 藏进路由组装里，会让"为什么这次没限流"变成一个要读两处代码才能回答的问题。
+	var limiter *ratelimit.Limiter
+	if cfg.RateLimitEnabled {
+		// 刻意用**专用** Redis 客户端而不是上面那个业务客户端。
+		// 原因见 ratelimit.New 的注释：go-redis 的 ctx deadline 拦不住
+		// 阻塞中的 socket 读，真正把单次判定钉在几百毫秒上的是
+		// 客户端自己的 ReadTimeout。而业务客户端的 ReadTimeout 是 3s
+		// （为 refresh 轮换定的），共用它会让限流在 Redis 卡顿时
+		// 把每个请求拖满 3 秒 —— 准入控制反而成了最大的一笔延迟。
+		rlRedis := ratelimit.NewDedicatedRedis(
+			cfg.RedisAddr, cfg.RedisPass, cfg.RedisDB, cfg.RateLimitTimeout)
+		defer func() { _ = rlRedis.Close() }()
+
+		limiter = ratelimit.New(rlRedis, "rl:"+cfg.AppEnv, cfg.RateLimitTimeout, cfg.RateLimitFailsClosed())
+		logger.Info("限流已启用",
+			slog.Bool("fails_closed", cfg.RateLimitFailsClosed()),
+			slog.Int("readwrite_limit", cfg.RateLimitMax),
+			slog.String("readwrite_window", cfg.RateLimitWindow.String()),
+			slog.Int("auth_limit", cfg.RateLimitAuthMax),
+			slog.String("auth_window", cfg.RateLimitAuthWindow.String()),
+			slog.String("judge_timeout", cfg.RateLimitTimeout.String()),
+		)
+	} else {
+		logger.Warn("限流已关闭：登录接口将没有频率限制，仅可用于本地开发")
+	}
+
 	var wechat auth.WechatExchanger
 	switch cfg.AuthProvider {
 	case "wechat":
@@ -133,6 +164,26 @@ func runServe(cfg *config.Config, logger *slog.Logger) error {
 		payProvider = payment.NewMock()
 	}
 
+	// 把"正在跑 mock"这件事写进启动日志。
+	//
+	// 配置校验已经保证了生产环境不会走到这里（除非显式开了逃生门），
+	// 但**日志是给事后复盘的人看的**：一个跑着 mock 支付的服务，
+	// 在日志里必须和跑真实支付的长得不一样。否则排查"这笔订单为什么没收到钱"
+	// 时，第一屏看不出任何异常。
+	if cfg.MockProvidersAllowed() {
+		attrs := []any{
+			slog.String("auth_provider", cfg.AuthProvider),
+			slog.String("payment_provider", cfg.PaymentProvider),
+			slog.String("env", cfg.AppEnv),
+		}
+		if cfg.IsProd() {
+			logger.Warn("⚠ 生产环境正在使用 mock provider（由 ALLOW_MOCK_PROVIDERS_IN_PROD 显式开启）"+
+				"：任意 code 可登录、任意订单可被标记为已支付。切勿用于真实业务。", attrs...)
+		} else {
+			logger.Info("使用 mock provider（开发环境）", attrs...)
+		}
+	}
+
 	handler := httpapi.NewRouter(httpapi.Deps{
 		Logger:       logger,
 		Pool:         pool,
@@ -142,9 +193,14 @@ func runServe(cfg *config.Config, logger *slog.Logger) error {
 		Wechat:       wechat,
 		Payment:      payProvider,
 		PendingTTL:   cfg.OrderPendingTTL,
+		RefreshTTL:   cfg.RefreshTTL,
+		Limiter:      limiter,
+		RateLimits:   ratelimit.Defaults{Window: cfg.RateLimitWindow, Limit: cfg.RateLimitMax},
+		AuthLimits:   ratelimit.Defaults{Window: cfg.RateLimitAuthWindow, Limit: cfg.RateLimitAuthMax},
 
 		CORSOrigins:    cfg.CORSOrigins(),
 		CORSAllowLocal: cfg.CORSAllowLocalhost(),
+		MaxBodyBytes:   cfg.MaxBodyBytes,
 	})
 
 	srv := &http.Server{
@@ -154,6 +210,10 @@ func runServe(cfg *config.Config, logger *slog.Logger) error {
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       60 * time.Second,
+		// Go 默认 1 MiB。主动收到 16 KiB：每个连接都要为 header 预留读缓冲，
+		// 而上限直接乘在连接数上。HTTP 头里装不下任何合法业务数据，
+		// 16 KiB 对一个带 JWT 的请求仍有几十倍余量。
+		MaxHeaderBytes: cfg.MaxHeaderBytes,
 	}
 
 	errCh := make(chan error, 1)

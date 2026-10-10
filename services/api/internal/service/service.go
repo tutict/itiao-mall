@@ -35,6 +35,10 @@ type Deps struct {
 	Payment      payment.Provider
 	Logger       *slog.Logger
 	PendingTTL   time.Duration
+	// RefreshTTL 是 refresh token 的有效期。必须由配置注入而不是在 service 里
+	// 写死：它要同时决定 Redis 缓存的 TTL 与数据库行的 expires_at，
+	// 两处一旦不一致就会出现"缓存先过期"或"库里的行还在但缓存没了"的窗口。
+	RefreshTTL time.Duration
 }
 
 type Service struct {
@@ -42,6 +46,20 @@ type Service struct {
 }
 
 func New(d Deps) *Service { return &Service{Deps: d} }
+
+// Logger 返回绑定了本服务的 logger，允许为空（此时不记日志）。
+//
+// 之所以要这个访问器而不是到处直接用 s.Logger 字段：
+// Deps.Logger 可能在测试里是 nil，而 token.go 里有十几处 s.Logger().Warn ——
+// 直接用字段的话每处都要写 `if s.Logger != nil`，
+// 而那种防御性判空一旦有一处漏掉就是 panic，测试期偶发、本地难复现。
+// 收在这里一处判，全代码路径都不会漏。
+func (s *Service) Logger() *slog.Logger {
+	if s.Deps.Logger == nil {
+		return slog.New(slog.DiscardHandler)
+	}
+	return s.Deps.Logger
+}
 
 // Session 是登录/刷新后返回给客户端的凭证组合。
 type Session struct {

@@ -132,6 +132,10 @@ func routePolicy(paymentProvider string) []access {
 		// 其余商户业务一律要求入驻已通过。
 		//   注意这里**含 SUSPENDED 也被挡住**：SUSPENDED 是平台事后处置（违规、纠纷），
 		//   它存在的意义就是立刻停掉这个商户的经营动作。如果它还能照常卖货，这个状态就是摆设。
+		//
+		//   /api/v1/merchant/products 由这条覆盖：商户没通过入驻审核时，
+		//   建的商品也不可能通过商品审核（审核队列里会出现一个店名都读不全的条目），
+		//   放他进来只会给审核员添垃圾。
 		{level: levelRoles, prefix: "/api/v1/merchant", roles: []string{auth.RoleMerchant}, requireApprovedMerchant: true},
 
 		// 平台运营。管理员**不能**走商户端接口 —— 平台身份与商户身份刻意不重叠，

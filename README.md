@@ -1,10 +1,16 @@
 # itiao-mall
 
-一个商城小应用的最小闭环：**用户端 App + Web（Expo / React Native）、商户端 App + Web、管理员端 App + Web、Go 后端 + k6 性能门禁**。
+一个商城应用的最小闭环：**用户端 App + Web（Expo / React Native）、商户端 App + Web、管理员端 App + Web、Go 后端 + k6 性能门禁**。
 
-当前阶段：打地基。三角色（user / merchant / admin）的权限模型、商户入驻与平台审核已落地；
-商户端与管理员端的**代码尚未开工**（`apps/merchant`、`apps/admin` 目前是空目录）。
-支付与微信登录都跑在 mock 网关上（还没有微信支付商户号与开放平台资质）；契约、防超卖、幂等、性能门禁这些都是真的。
+当前阶段：**后端已成型，前端只做了用户端**。
+
+- **已落地，且有测试与变异守卫**：三角色权限模型（user / merchant / admin）· 商户入驻与平台审核 ·
+  商户商品管理与审核（5 状态机 + 审核 CAS）· Redis 滑动窗口限流 · refresh token 一次性轮换
+  （PostgreSQL 为权威、Redis 为加速层）· 防超卖与幂等 · k6 两层性能门禁。
+- **尚未开工**：商户端 / 管理员端的**前端**（`apps/merchant`、`apps/admin` 目前是空目录）。
+  对应的**后端接口已就绪**（见 `docs/openapi/openapi.yaml`），缺的只是界面。
+- **仍是 mock**：支付与微信登录走 mock 网关（还没有微信支付商户号与开放平台资质）。
+  生产环境**默认禁止** mock provider，要开必须显式设逃生门 —— 见 [安全加固报告](docs/security-hardening.md)。
 
 ## 技术选型
 
@@ -12,7 +18,7 @@
 | --- | --- | --- |
 | 用户端 | Expo SDK 57 + Expo Router | 一套代码出 Android / iOS。Metro 用 Babel 剥类型，**不依赖 tsc 的编程式 API**，所以能跟上 TS 7 |
 | 商户端 | 同上（独立 Expo 代码库） | P1，尚未开工 |
-| 后端 | Go 1.25 + chi v5 | chi 与 oapi-codegen 的 chi-server 生成器零摩擦（gin/echo 得包一层自定义 Context） |
+| 后端 | Go 1.26 + chi v5 | chi 与 oapi-codegen 的 chi-server 生成器零摩擦（gin/echo 得包一层自定义 Context）。工具链漏洞用 `govulncheck` 卡，见「安全」一节 |
 | 契约 | OpenAPI 3.0.3 | **前后端唯一真源**。3.0（不是 3.1）是为了 oapi-codegen 的兼容性 |
 | 代码生成 | oapi-codegen → Go 严格接口；openapi-typescript → TS 类型 | 生成物提交进仓库，用 `git diff --exit-code` 卡漂移 |
 | 数据访问 | sqlc + pgx/v5 | 编译期类型安全的 SQL，不用反射、不引入 ORM |
@@ -30,11 +36,13 @@ services/api/             Go 后端
   cmd/hashpw/             生成 bcrypt 口令（给商户账号用）
   db/migrations/          goose 迁移
   db/queries/             sqlc 查询
-  internal/domain/        订单状态机（流转规则的唯一真源）
+  internal/domain/        状态机唯一真源（订单流转 + 商品 5 状态）
+  internal/config/        环境变量解析 + fail-fast 校验（生产禁 mock provider、体积上限、限流阈值）
   internal/auth/          JWT 签发/校验、refresh 轮换与家族吊销、微信 exchanger
+  internal/ratelimit/     Redis 滑动窗口限流（ZSET + Lua 原子脚本 + 降级决策）
   internal/payment/       支付网关抽象 + mock 实现
-  internal/service/       业务事务边界
-  internal/httpapi/       契约生成接口的实现 + 统一错误映射
+  internal/service/       业务事务边界（token 轮换编排、商品审核）
+  internal/httpapi/       接口实现 + 中间件链（CORS / 认证 / 限流 / 体积 / 安全头）+ 统一错误映射
 docs/openapi/openapi.yaml  契约真源
 deploy/                   docker-compose（dev / perf）
 scripts/                  入口脚本，详见下方「脚本清单」
@@ -52,7 +60,7 @@ tools/loadtest/           k6 场景、种子数据、基线、比对脚本
 | `api.sh` | 起后端（默认 `:8080`，providers=mock） | |
 | `perf.sh` | k6 压测 + 与基线比对（会 reset 并 seed 数据库） | |
 | `verify-perf-gate.sh` | 变异验证：证明性能门禁真的能拦住回归 | |
-| `verify-guards.py` | 变异验证：证明权限/审核/错误泄露/分页守卫真的有牙 | |
+| `verify-guards.py` | 变异验证：证明权限 / 审核 / 错误泄露 / 分页 / 限流 / refresh / 商品 / 安全加固的守卫真的有牙（38 条变异体）。`--audit` 只做残留自检，`--from/--to` 分批跑，`--packages` 收窄到不依赖 DB 的包 | |
 | `verify-onboarding-flow.py` | 对活服务器跑一遍商户入驻全生命周期（35 步状态码断言） | |
 | `acceptance-app.mjs` | 用户端端到端验收（真实 Chromium 驱动，15 项） | |
 | `preview-web.mjs` | Expo web 产物的静态预览服务器（验收脚本的前置） | |
@@ -202,6 +210,23 @@ node --test tools/loadtest/scripts/compare.test.mjs   # 门禁自身的单元测
 - **令牌**：access 用 JWT（HS256，15 分钟）；refresh 是 Redis 里的不透明 token，**一次性轮换**。
   同一个已消费的 refresh token 再次出现即视为重放，整个 token family 被吊销。
 
+## 安全
+
+一轮完整的攻击面审计与加固，结论见 [docs/security-hardening.md](docs/security-hardening.md)。要点：
+
+- **生产禁 mock**：`PAYMENT_PROVIDER` / `AUTH_PROVIDER` 默认都是 `mock`，而 mock 实现完全不设防
+  （任意 `order_no` 可标记已支付、任意 `code` 可登录）。生产环境**默认拒绝启动**，除非显式设
+  `ALLOW_MOCK_PROVIDERS_IN_PROD=true`（此时启动打 Warn）。这与 `JWT_SECRET` 的生产校验同构。
+- **请求体 / 请求头上限**：`MAX_BODY_BYTES`（默认 1 MiB）+ `MAX_HEADER_BYTES`（默认 16 KiB）。
+  有 body 的方法必须带 `Content-Length`（否则 411）；超限 413，且**一个字节都不读**。
+- **安全响应头**：`nosniff` / `X-Frame-Options` / CSP / `Referrer-Policy` / `CORP`，
+  在写响应的**那一刻**强制覆盖 —— 下游任何同名写入都盖不掉它。
+- **依赖漏洞**：`govulncheck ./...` 会卡标准库与依赖漏洞。当前基线 Go 1.26.0 还挂着 28 条
+  标准库漏洞（`net/http` HTTP/2 那批是远程可达的 DoS），升到 1.26.1+ 才能清掉 —— **待办**。
+
+**刻意没加 HSTS**：它属于域名级 TLS 终止点，而本服务跑在同机 HTTP 后面（本地 `:8080`、容器内 `:8080`）。
+在这里加要么无效，要么把 localhost 钉成 HTTPS 让人没法调试。它属于部署清单，不属于应用。
+
 ## 已知约束与踩过的坑
 
 这些都是本机实测撞出来的，写下来免得重踩。
@@ -237,7 +262,26 @@ TypeError: Cannot read properties of undefined (reading 'createKeywordTypeNode')
 
 ## 状态
 
-已完成（P0）：契约与双向代码生成 · PG+Redis · 迁移 · 认证（JWT + refresh 轮换）· 商品/购物车/订单/支付 ·
-反超卖与幂等（含并发测试）· k6 冒烟与稳态场景 · 基线 · 门禁有牙验证 · Expo App 闭环页面。
+**已完成**：契约与双向代码生成 · PG + Redis · 迁移 · 认证（JWT + refresh 一次性轮换，DB 权威）·
+商品 / 购物车 / 订单 / 支付 · 反超卖与幂等（含并发测试）· 三角色权限与商户入驻审核 ·
+商户商品管理与审核（5 状态机 + CAS）· Redis 滑动窗口限流 · 一轮安全加固（2 个 P0）·
+k6 两层性能门禁 · 基线 · 性能门禁有牙验证 · 变异验证 38 条 · Expo 用户端闭环页面。
 
-下一步（P1）：商户端 Web、商品管理接口、订单履约（发货/完成/退款）。
+**下一步**：商户端 / 管理员端前端（`apps/merchant`、`apps/admin`）· 订单履约（发货 / 完成 / 退款，
+`order_items` 加履约字段）· 微信支付 provider · 抽 `packages/api-client`。
+
+**挂着待拍板的架构项**（不是打补丁能解决的，详见下面两份文档）：
+
+1. **订单状态机未收归 `domain`** —— `SHIPPED / COMPLETED / REFUNDING / REFUNDED` 四态目前**无任何写入路径**，
+   支付回调与取消各自手写 SQL 白名单，已经产生实质分歧（领域层判 `CREATED → PAID` 非法，实际却在走）。
+2. **Go 工具链 28 条标准库漏洞** —— 全部 `Fixed in go1.26.1`，其中 `net/http` 那批是远程可达的 DoS。
+3. **微信支付 / 微信登录的真实实现** —— 目前是 mock，需要商户号 + 开放平台资质。
+
+## 文档
+
+| 文档 | 内容 |
+| --- | --- |
+| [`docs/openapi/openapi.yaml`](docs/openapi/openapi.yaml) | **契约真源**。前后端唯一真源，改它必须跑 `scripts/gen.sh` 并用 `git diff --exit-code` 卡漂移 |
+| [`docs/task13-delivery.md`](docs/task13-delivery.md) | 限流 / refresh 轮换原子化 / 商户商品管理与审核的交付说明（并发边界、失败重试、测试清单、变异表） |
+| [`docs/security-hardening.md`](docs/security-hardening.md) | 安全加固报告：9 个攻击面、7 个真实问题（2 个 P0）、改法与证据、变异验证 |
+| `README.md`（本文） | 项目总览：选型 · 目录 · 脚本 · 快速开始 · CORS · 性能门禁 · 安全 · 状态 |
