@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/tutic/itiao-mall/services/api/internal/auth"
@@ -70,6 +71,23 @@ func clientIP(r *http.Request) string {
 // 应该在任何业务查库之前就把超额请求挡掉。换个顺序的话，被限流的请求
 // 依然会打一次库，白白消耗连接池 —— 而连接池正是限流风暴时最紧张的资源。
 func rateLimitGate(limiter *ratelimit.Limiter, table []rateRule, def ratelimit.Defaults) func(http.Handler) http.Handler {
+	// backendDown 记录"当前是否处于降级中"；lastDegradedWarn 是降级日志的节流时间戳。
+	//
+	// 为什么不逐条记：Redis 挂掉的整段时间里，每个请求都会走到 degraded 分支，
+	// 逐条 Warn 会让日志量正比于**请求量** —— 而日志 I/O 正是故障时最该省下的资源。
+	// 熔断已经把"每请求都去试 Redis"消掉了，这一条日志若还逐条打，
+	// 等于把刚省下的开销从日志这个口子原样放回去。
+	//
+	// ★ 也不能只靠"状态翻转"（第一版如此）：Redis 间歇性抖动时降级/恢复会反复翻转，
+	// 而翻转本身就退化成高频事件 —— 同一个缺陷在并发闸门那边被实测抓到
+	//（60 秒产生 268,176 条），详见 logThrottleInterval 的注释。
+	// 所以降级日志按**时间**节流；恢复日志仍以"曾经降级"为条件，
+	// 否则每个正常请求都会在节流窗口外记一条"已恢复"。
+	var (
+		backendDown      atomic.Bool
+		lastDegradedWarn atomic.Int64
+	)
+
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			// 预检不带 Authorization，也不携带业务语义，限它没有意义。
@@ -98,14 +116,16 @@ func rateLimitGate(limiter *ratelimit.Limiter, table []rateRule, def ratelimit.D
 				return
 			}
 			if degraded {
-				logging.From(r.Context()).Warn("限流后端不可用，按配置降级",
-					"path", r.URL.Path,
-					"scope", scope,
-					"fails_closed", limiter.FailsClosed(),
-					// 显式取 Cause：BackendError.Error() 只回哨兵文案（防内网地址外泄），
-					// 直接记 err 会把诊断信息一起丢掉。原文只进这里，不回响应体。
-					"err", ratelimit.Cause(err),
-				)
+				backendDown.Store(true)
+				if logThrottled(&lastDegradedWarn, logThrottleInterval) {
+					logging.From(r.Context()).Warn("限流后端不可用，降级中",
+						"scope", scope,
+						"fails_closed", limiter.FailsClosed(),
+						// 显式取 Cause：BackendError.Error() 只回哨兵文案（防内网地址外泄），
+						// 直接记 err 会把诊断信息一起丢掉。原文只进这里，不回响应体。
+						"err", ratelimit.Cause(err),
+					)
+				}
 				// fail-closed 时 Decide 返回 Allowed=false，此时**不能**回 429。
 				// 429 会被客户端读成"你太频繁了"从而退避不重试 ——
 				// 而真实原因是"我们这边的限流器坏了"。那样限流器一挂，
@@ -114,6 +134,8 @@ func rateLimitGate(limiter *ratelimit.Limiter, table []rateRule, def ratelimit.D
 					WriteProblem(w, r, domain.ErrRateLimitUnavailable)
 					return
 				}
+			} else if backendDown.CompareAndSwap(true, false) {
+				logging.From(r.Context()).Info("限流后端已恢复，退出降级")
 			}
 
 			// 无论放行还是拒绝都写响应头：客户端据此能主动退避，

@@ -475,7 +475,8 @@ func (f failingScripter) ScriptLoad(ctx context.Context, _ string) *redis.String
 func TestAllow_HasItsOwnTimeout(t *testing.T) {
 	addr := startBlackHoleRedis(t)
 	// 走 NewDedicatedRedis 才是生产路径 —— 它带 ReadTimeout。
-	rdb := NewDedicatedRedis(addr, "", 0, 200*time.Millisecond)
+	// poolSize 传 0：本测试只关心超时，池大小与本条无关（0 会用默认）。
+	rdb := NewDedicatedRedis(addr, "", 0, 200*time.Millisecond, 0)
 	t.Cleanup(func() { _ = rdb.Close() })
 	l := New(rdb, "rl:blackhole", 200*time.Millisecond, true)
 

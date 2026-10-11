@@ -89,6 +89,18 @@ type Config struct {
 	// 而生产用 auto ⇒ closed（Redis 本来就是硬依赖，readyz 已经在查它了）。
 	RateLimitFailMode string `env:"RATE_LIMIT_FAIL_MODE" envDefault:"auto"`
 
+	// 限流后端的熔断参数（见 ratelimit.WithBreaker 与 circuitbreaker 包）。
+	//
+	// ★ 熔断解决的是 Decide 的降级逻辑**解决不了**的那一半：Decide 只决定
+	// "失败之后怎么答"，不决定"还要不要每次都去试"。没有熔断时，Redis 挂掉的
+	// 整段时间里，每个请求仍要付一次完整的判定超时 —— 那是把 Redis 的故障时长
+	// 乘以请求量转嫁成我们自己的故障。
+	//
+	// 阈值 × RateLimitTimeout ≈ 最坏情况下还要硬撑多久（默认 5 × 300ms ≈ 1.5s）。
+	// 冷却时长决定了 Redis 恢复后服务自愈的最坏延迟（首个探测成功即闭合）。
+	RateLimitBreakerThreshold int           `env:"RATE_LIMIT_BREAKER_THRESHOLD" envDefault:"5"`
+	RateLimitBreakerOpen      time.Duration `env:"RATE_LIMIT_BREAKER_OPEN" envDefault:"5s"`
+
 	// ============================ token 签发并发 ============================
 	//
 	// 一次登录/刷新里有多步彼此无依赖的 IO（校验 refresh 记录、签 access token、
@@ -117,6 +129,67 @@ type Config struct {
 	// 若将来支持图片内联上传，这个值要按 base64 膨胀率（×1.37）重算。
 	MaxBodyBytes   int64 `env:"MAX_BODY_BYTES" envDefault:"1048576"`
 	MaxHeaderBytes int   `env:"MAX_HEADER_BYTES" envDefault:"16384"`
+
+	// ============================ 并发与连接上限 ============================
+	//
+	// 见 internal/platform/connlimit 与 httpapi.ConcurrencyGate 的文档注释。
+	// 两者是**互补**的两道闸门，守的是不同的资源：
+	//   - MaxConns 守 file descriptor：限制同时打开的 TCP 连接（含 Keep-Alive 空闲连接）。
+	//   - MaxInflightRequests 守 goroutine 与下游连接池：限制同时在 handler 里的请求。
+	//
+	// 都为 0 表示**显式关闭**该项保护（合法，但见下面的风险说明）。
+	// 默认给非 0 值：忘记配置时得到保护，而不是裸奔。
+
+	// MaxConns 是同时打开的 TCP 连接数上限。
+	//
+	// ★ 它与进程的 RLIMIT_NOFILE 是**乘法**关系，配错了等于没配：
+	// fd 上限是进程级资源，被连接吃光之后日志、DB 连接、健康探针会一起失败。
+	// 所以这个值必须 ≤ RLIMIT_NOFILE 减去其它 fd 占用（PG 池、Redis 池、日志、
+	// epoll 等）。Linux 默认 soft limit 常是 1024 —— 若不动 ulimit，
+	// 4096 这个默认值就永远达不到，实际生效的是 fd 上限，表现为 accept 报错
+	// 而不是新连接被干净地挡在闸门外。容器部署需显式配 ulimits / --ulimit nofile。
+	MaxConns int `env:"MAX_CONNS" envDefault:"4096"`
+
+	// MaxInflightRequests 是同时在处理中的请求数上限（并发准入闸门）。
+	//
+	// 默认 2048 的依据是实测饱和点：读接口吞吐约 10k req/s，饱和时 p50 约 90ms，
+	// 按 Little 定律 L = λ×W ≈ 900 并发。2048 给了约 2 倍余量 ——
+	// 正常负载下闸门不介入（不误伤），只有真正接近雪崩时才拒绝。
+	//
+	// 它同时是 PG 连接池（MaxConns=20）的**上游保护**：闸门不直接管池，
+	// 但它把"同时进入业务的请求数"钉住，于是池不会被压满、不会有请求
+	// 在 acquire 上排队到 30 秒超时（超时瀑布的起点）。
+	MaxInflightRequests int `env:"MAX_INFLIGHT_REQUESTS" envDefault:"2048"`
+
+	// ============================ 下游连接池 ============================
+	//
+	// 三个池是三种独立的稀缺资源，各自的上限对应"我们允许同时有多少个
+	// 在飞的下游调用"。它们都比 MaxInflightRequests 小得多 —— 这不是矛盾，
+	// 而是**分层背压**：闸门在入口按请求数限流，池在更内层按下游并发限流，
+	// 中间"进了闸门但还没轮到池"的请求由 ctx 超时兜底。
+	//
+	// 全部做成可配的理由：合适的大小取决于下游部署形态（同机 / 跨机房 / 托管 PG），
+	// 写死一个数字必然在某些部署里偏小（自己成为瓶颈）、另一些里偏大（压垮下游）。
+
+	// PGMaxConns 是 PG 连接池上限。
+	PGMaxConns int `env:"PG_MAX_CONNS" envDefault:"20"`
+
+	// RedisPoolSize 是**业务** Redis 客户端的池大小（refresh 轮换、幂等键等）。
+	RedisPoolSize int `env:"REDIS_POOL_SIZE" envDefault:"20"`
+
+	// RateLimitRedisPoolSize 是**限流专用** Redis 客户端的池大小。
+	//
+	// 默认 100（而不是原先写死的 10）有实测依据：本机独立实验里，同 Lua、
+	// 同调用形状下池 10→100 吞吐从 19,397 涨到 54,552 req/s（2.8 倍），
+	// 100 之后饱和（200 无进一步收益，Redis 单线程已满）。
+	//
+	// 原来写 10 的理由是"准入通道不需要吞吐"。这个判断在**一次往返约 300µs**
+	// 的部署里是错的：池大小直接决定"同时在飞的准入判定数"，而准入判定是
+	// 每个请求都要做的必答题 —— 它不是不需要吞吐，而是吞吐被池大小卡住了。
+	//
+	// 池变大之后"Redis 挂时更多请求卡在同一个坏对端"的顾虑，由
+	// RATE_LIMIT_BREAKER_* 处理：熔断打开后根本不碰 Redis，与池里有多少连接无关。
+	RateLimitRedisPoolSize int `env:"RATE_LIMIT_REDIS_POOL_SIZE" envDefault:"100"`
 
 	// ============================ 性能剖析 ============================
 	//
@@ -219,6 +292,26 @@ func (c *Config) validate() error {
 		// 上限越大，同样连接数下内存占用越高。
 		return fmt.Errorf("MAX_HEADER_BYTES 不能小于 4096（当前 %d）", c.MaxHeaderBytes)
 	}
+	// 负数一律拒绝；0 是**显式关闭**该项保护，合法但危险。
+	//
+	// 为什么两者分开处置：负数一定是笔误（没有任何"负的上限"语义），
+	// 必须在启动时就响；而 0 是一个有意为之的选择（比如上游网关已经限了，
+	// 或本地开发不想被闸门打扰）。把 0 也拒掉会逼人用魔法大数（1e9）
+	// 来表达"关闭"，那才真正不可读。
+	if c.MaxConns < 0 {
+		return fmt.Errorf("MAX_CONNS 不能为负数（当前 %d；0 表示不限制连接数）", c.MaxConns)
+	}
+	if c.MaxInflightRequests < 0 {
+		return fmt.Errorf("MAX_INFLIGHT_REQUESTS 不能为负数（当前 %d；0 表示不限制并发）", c.MaxInflightRequests)
+	}
+	// 下游池大小必须 ≥ 1：0 或负数会让池建不出任何连接，
+	// 表现为"服务起来了、但所有查询都超时"，而启动阶段看不出任何异常。
+	if c.PGMaxConns < 1 {
+		return fmt.Errorf("PG_MAX_CONNS 必须 ≥ 1（当前 %d）", c.PGMaxConns)
+	}
+	if c.RedisPoolSize < 1 {
+		return fmt.Errorf("REDIS_POOL_SIZE 必须 ≥ 1（当前 %d）", c.RedisPoolSize)
+	}
 	return nil
 }
 
@@ -296,7 +389,7 @@ func (c *Config) validatePprof() error {
 	}
 	if c.PprofMaxSeconds > pprofMaxSecondsCap {
 		// 上界不是性能保护，是**配置事故的护栏**。采样时长配成 86400
-		//（"录一整天"）会让 profiling 几乎永久生效，而它的表现
+		// （"录一整天"）会让 profiling 几乎永久生效，而它的表现
 		//（服务变慢）不像错误、像负载问题 —— 排障方向会从一开始就错。
 		// 真要长时间采样就分多次抓，不要拉长单个窗口。
 		return fmt.Errorf("PPROF_MAX_SECONDS 不能超过 %d 秒（当前 %d）",
@@ -348,6 +441,17 @@ func (c *Config) validateRateLimit() error {
 	}
 	if c.RateLimitTimeout <= 0 {
 		return fmt.Errorf("RATE_LIMIT_TIMEOUT 必须为正数")
+	}
+	if c.RateLimitRedisPoolSize < 1 {
+		return fmt.Errorf("RATE_LIMIT_REDIS_POOL_SIZE 必须 ≥ 1（当前 %d）", c.RateLimitRedisPoolSize)
+	}
+	if c.RateLimitBreakerThreshold < 1 {
+		// 0 会让熔断器永远打不开（形同没有），而这是**安全侧的静默失效**：
+		// 现象只是"Redis 挂了之后整站变慢"，不会有任何一条报错指向这个配置。
+		return fmt.Errorf("RATE_LIMIT_BREAKER_THRESHOLD 必须 ≥ 1（当前 %d）", c.RateLimitBreakerThreshold)
+	}
+	if c.RateLimitBreakerOpen <= 0 {
+		return fmt.Errorf("RATE_LIMIT_BREAKER_OPEN 必须为正数")
 	}
 	return nil
 }

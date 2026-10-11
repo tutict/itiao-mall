@@ -37,7 +37,7 @@ func WriteJSON(w http.ResponseWriter, status int, v any) {
 // 这是唯一的映射点 —— 业务层不需要知道 HTTP 的存在。
 func WriteProblem(w http.ResponseWriter, r *http.Request, err error) {
 	status, title := mapError(err)
-	if status >= http.StatusInternalServerError {
+	if status >= http.StatusInternalServerError && shouldLogAsError(err) {
 		// 5xx 记完整错误，但对外只回一句泛化描述
 		logging.From(r.Context()).Error("请求处理失败",
 			slog.String("path", r.URL.Path),
@@ -77,6 +77,26 @@ func WriteProblem(w http.ResponseWriter, r *http.Request, err error) {
 	})
 }
 
+// shouldLogAsError 决定一个 5xx 响应是否要**逐条**记 Error 日志。
+//
+// ★ 为什么需要这个例外
+//
+// "所有 5xx 都记一条 Error" 在正常情况下是对的：5xx 意味着我们坏了，
+// 每一条都值得留痕。但有一类 5xx 是**预期内的背压**而不是故障 ——
+// 并发闸门拒绝（ErrServiceOverloaded）。它在过载时按**请求频率**产生，
+// 于是"每请求一条 Error"会让日志 I/O 变成新的耗尽点：
+// 磁盘写满 → 服务彻底不可用，而这一场拒绝风暴本来只是想保住服务。
+//
+// 换句话说：闸门在访问日志**之前**被刻意安排（见 ConcurrencyGate 的注释），
+// 就是为了让被拒请求不产生访问日志；若这里再逐条记 Error，
+// 那个安排就被从侧门绕过了。它的可观测性改由闸门自己的日志承担，
+// 且那两条日志都**不按请求**记：过载告警按时间节流（每 10 秒至多一条），
+// 恢复只记一条（CAS）。条目数与"过载时长 / 过载事件次数"成正比，
+// 而不是与请求数成正比。
+func shouldLogAsError(err error) bool {
+	return !errors.Is(err, domain.ErrServiceOverloaded)
+}
+
 func mapError(err error) (int, string) {
 	switch {
 	case errors.Is(err, domain.ErrNotFound):
@@ -86,6 +106,11 @@ func mapError(err error) (int, string) {
 		// 回 429 会让客户端把它当成自己的问题而退避不重试，
 		// 于是限流器挂掉的整段时间里全站被客户端主动放弃。
 		return http.StatusServiceUnavailable, "服务暂不可用"
+	case errors.Is(err, domain.ErrServiceOverloaded):
+		// 503 而不是 429：这是**容量**信号（整机满了），不是"你太频繁"。
+		// 见 domain.ErrServiceOverloaded 的注释 —— 混成 429 会让客户端
+		// 用"等一秒再来"的方式应对一个需要扩容才能解决的问题。
+		return http.StatusServiceUnavailable, "服务繁忙"
 	case errors.Is(err, domain.ErrRateLimited):
 		return http.StatusTooManyRequests, "请求过于频繁"
 	case errors.Is(err, domain.ErrPayloadTooLarge):

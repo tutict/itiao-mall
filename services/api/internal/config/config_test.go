@@ -1,9 +1,32 @@
 package config
 
 import (
+	"os"
 	"strings"
 	"testing"
 )
+
+// unsetEnv 临时移除若干环境变量，测试结束后恢复。
+//
+// 为什么必须用它而不是 t.Setenv(k, "")：caarlos0/env 的 envDefault 只在变量
+// **不存在**时生效；变量存在但为空串会走进解析失败，得到的是"报错"而不是
+// "拿到默认值"。所以要测真默认值，只能真的把变量摘掉。
+func unsetEnv(t *testing.T, keys ...string) {
+	t.Helper()
+	for _, k := range keys {
+		old, existed := os.LookupEnv(k)
+		if err := os.Unsetenv(k); err != nil {
+			t.Fatalf("unset %s: %v", k, err)
+		}
+		t.Cleanup(func() {
+			if existed {
+				_ = os.Setenv(k, old)
+			} else {
+				_ = os.Unsetenv(k)
+			}
+		})
+	}
+}
 
 // baseEnv 把会影响 Load() 的所有相关变量显式设成一组已知值。
 //
@@ -22,6 +45,15 @@ func baseEnv(t *testing.T) {
 	t.Setenv("DATABASE_URL", "postgres://itiao:itiao@localhost:5432/itiao?sslmode=disable")
 	t.Setenv("MAX_BODY_BYTES", "1048576")
 	t.Setenv("MAX_HEADER_BYTES", "16384")
+	// 资源上限类。与上面同理：显式设全部，避免机器上恰好导出了
+	// MAX_INFLIGHT_REQUESTS=1 之类的值时，测试变得依赖机器状态。
+	t.Setenv("MAX_CONNS", "4096")
+	t.Setenv("MAX_INFLIGHT_REQUESTS", "2048")
+	t.Setenv("PG_MAX_CONNS", "20")
+	t.Setenv("REDIS_POOL_SIZE", "20")
+	t.Setenv("RATE_LIMIT_REDIS_POOL_SIZE", "100")
+	t.Setenv("RATE_LIMIT_BREAKER_THRESHOLD", "5")
+	t.Setenv("RATE_LIMIT_BREAKER_OPEN", "5s")
 }
 
 // TestValidate_MockProvidersRejectedInProd 是这一组的核心断言。
@@ -356,5 +388,113 @@ func TestPprofEnabled_DefaultIsOff(t *testing.T) {
 	if cfg.PprofEnabled() {
 		t.Fatal("未配置 PPROF_ADDR 时 PprofEnabled() 为 true —— " +
 			"剖析端点必须默认不存在（它可以读到进程内存）")
+	}
+}
+
+// TestDefaults_AreProtective 守住"资源上限默认就是开着的"。
+//
+// ★ 为什么这条比边界测试更重要
+//
+// 容量保护最可能的失效方式不是"配错值"，而是"默认值被改成 0 / 关闭"。
+// 那种改动**不会让任何测试变红**（0 是合法配置、启动照常），
+// 现象是"服务在裸奔，但一切看起来正常"，直到某天被打挂才发现。
+// 所以这里把"默认必须为正"写死成断言 —— 谁把默认值改成 0，这里立刻红。
+func TestDefaults_AreProtective(t *testing.T) {
+	baseEnv(t)
+	// 摘掉这几个变量，才能读到**真默认值**而不是 baseEnv 里显式设的值。
+	unsetEnv(t,
+		"MAX_CONNS", "MAX_INFLIGHT_REQUESTS",
+		"PG_MAX_CONNS", "REDIS_POOL_SIZE", "RATE_LIMIT_REDIS_POOL_SIZE",
+		"RATE_LIMIT_BREAKER_THRESHOLD", "RATE_LIMIT_BREAKER_OPEN",
+	)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load 失败: %v", err)
+	}
+
+	if cfg.MaxConns <= 0 {
+		t.Error("MAX_CONNS 默认必须是正数（0 = 连接数无上限，fd 可被慢速攻击抽干）")
+	}
+	if cfg.MaxInflightRequests <= 0 {
+		t.Error("MAX_INFLIGHT_REQUESTS 默认必须是正数（0 = 并发无上限，超时瀑布）")
+	}
+	if cfg.PGMaxConns < 1 {
+		t.Error("PG_MAX_CONNS 默认必须 ≥ 1")
+	}
+	if cfg.RedisPoolSize < 1 {
+		t.Error("REDIS_POOL_SIZE 默认必须 ≥ 1")
+	}
+	if cfg.RateLimitRedisPoolSize < 1 {
+		t.Error("RATE_LIMIT_REDIS_POOL_SIZE 默认必须 ≥ 1")
+	}
+	if cfg.RateLimitBreakerThreshold < 1 {
+		t.Error("RATE_LIMIT_BREAKER_THRESHOLD 默认必须 ≥ 1（0 = 熔断永不打开，安全侧静默失效）")
+	}
+	if cfg.RateLimitBreakerOpen <= 0 {
+		t.Error("RATE_LIMIT_BREAKER_OPEN 默认必须为正")
+	}
+}
+
+// TestValidate_ResourceLimits 守资源上限的取值边界。
+//
+// 边界的着重点是"负数必须响"与"0 的语义必须明确"：
+//   - 负数一定是笔误，没有任何"负的上限"语义，必须在启动时拦住；
+//   - 0 对 MAX_CONNS / MAX_INFLIGHT_REQUESTS 是**显式关闭**（合法），
+//     对连接池和熔断阈值则是**非法**（会让池建不出连接 / 熔断永不打开）。
+//     两者分开处置，才不会逼人用魔法大数（1e9）表达"关闭"。
+func TestValidate_ResourceLimits(t *testing.T) {
+	cases := []struct {
+		name       string
+		env        map[string]string
+		wantErrSub string
+	}{
+		{"默认值全部合法", nil, ""},
+
+		{"MAX_CONNS 为 0：合法（显式关闭连接上限）", map[string]string{"MAX_CONNS": "0"}, ""},
+		{"MAX_CONNS 为负：拒绝", map[string]string{"MAX_CONNS": "-1"}, "MAX_CONNS"},
+
+		{"MAX_INFLIGHT_REQUESTS 为 0：合法（显式关闭闸门）",
+			map[string]string{"MAX_INFLIGHT_REQUESTS": "0"}, ""},
+		{"MAX_INFLIGHT_REQUESTS 为负：拒绝",
+			map[string]string{"MAX_INFLIGHT_REQUESTS": "-5"}, "MAX_INFLIGHT_REQUESTS"},
+
+		{"PG_MAX_CONNS 为 0：拒绝（池建不出连接）", map[string]string{"PG_MAX_CONNS": "0"}, "PG_MAX_CONNS"},
+		{"REDIS_POOL_SIZE 为负：拒绝", map[string]string{"REDIS_POOL_SIZE": "-1"}, "REDIS_POOL_SIZE"},
+		{"RATE_LIMIT_REDIS_POOL_SIZE 为 0：拒绝",
+			map[string]string{"RATE_LIMIT_REDIS_POOL_SIZE": "0"}, "RATE_LIMIT_REDIS_POOL_SIZE"},
+
+		{"熔断阈值为 0：拒绝（熔断永不打开）",
+			map[string]string{"RATE_LIMIT_BREAKER_THRESHOLD": "0"}, "RATE_LIMIT_BREAKER_THRESHOLD"},
+		{"熔断冷却为 0：拒绝",
+			map[string]string{"RATE_LIMIT_BREAKER_OPEN": "0s"}, "RATE_LIMIT_BREAKER_OPEN"},
+
+		// 关掉限流后，限流专属的几项不该再参与校验 ——
+		// 否则会出现"明明关了限流，却因为熔断参数没配对而启动失败"这种反直觉组合。
+		{"限流关闭时熔断参数不校验",
+			map[string]string{"RATE_LIMIT_ENABLED": "false", "RATE_LIMIT_BREAKER_THRESHOLD": "0"}, ""},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			baseEnv(t)
+			for k, v := range tc.env {
+				t.Setenv(k, v)
+			}
+
+			_, err := Load()
+			if tc.wantErrSub == "" {
+				if err != nil {
+					t.Fatalf("期望通过，实际报错: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("期望报错，实际通过")
+			}
+			if !strings.Contains(err.Error(), tc.wantErrSub) {
+				t.Errorf("错误信息应提到 %s，实际: %v", tc.wantErrSub, err)
+			}
+		})
 	}
 }

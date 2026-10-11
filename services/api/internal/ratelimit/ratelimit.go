@@ -36,6 +36,8 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
+
+	"github.com/tutic/itiao-mall/services/api/internal/platform/circuitbreaker"
 )
 
 // ErrBackendUnavailable 表示 Redis 侧不可用（连不上、超时、返回了非法响应）。
@@ -165,8 +167,51 @@ type Limiter struct {
 	// failsClosed 决定后端故障时是收紧（拒绝）还是放开（放行）。
 	failsClosed bool
 
+	// breaker 是限流后端的熔断器。nil 表示关闭熔断（仅测试用，见 WithoutBreaker）。
+	//
+	// 它解决的是 Decide 的降级逻辑**解决不了**的那一半：Decide 只决定"失败之后
+	// 怎么答"，没决定"还要不要每次都去试"。没有熔断时，Redis 挂掉的整段时间里，
+	// 每个请求仍然要付一次完整的判定超时（默认 300ms）—— 一个每请求必经的
+	// 300ms 等待，在并发下就是一台正在被自己拖垮的机器。
+	breaker *circuitbreaker.Breaker
+
 	// now 可注入，便于测试里精确控制时间边界。
 	now func() time.Time
+}
+
+// 熔断器的默认参数。
+const (
+	// DefaultBreakerThreshold 是"连续多少次判定失败后打开熔断"。
+	//
+	// 取 5 而不是 1：偶发的单次网络抖动不该触发熔断（那会让限流在正常波动下
+	// 频繁降级）。也不要太大 —— 阈值 × timeout 就是"最坏情况下继续硬撑多久"，
+	// 5 × 300ms ≈ 1.5 秒，超过这个时长还没有一次成功，基本可以直接判定不可用。
+	DefaultBreakerThreshold = 5
+
+	// DefaultBreakerOpenDuration 是熔断后的冷却时长。
+	//
+	// 取 5 秒：短到 Redis 恢复后 5 秒内服务就能自愈，长到不会在依赖刚挂时
+	// 被探测流量反复冲击。（首测成功后立即闭合，所以它只是"最坏自愈延迟"。）
+	DefaultBreakerOpenDuration = 5 * time.Second
+)
+
+// Option 用来覆盖 Limiter 的默认装配。
+type Option func(*Limiter)
+
+// WithBreaker 覆盖默认的熔断参数。
+func WithBreaker(failThreshold int, openDuration time.Duration) Option {
+	return func(l *Limiter) {
+		l.breaker = circuitbreaker.New(failThreshold, openDuration)
+	}
+}
+
+// WithoutBreaker 关闭熔断。
+//
+// 只应在测试里用：它把"每请求都去试一次后端"的旧行为恢复出来，
+// 用于测那些专门验证超时/错误路由的用例（见 ratelimit_test.go 里几条
+// 关于黑洞后端的测试 —— 它们要观察的恰恰是"没有熔断时会发生什么"）。
+func WithoutBreaker() Option {
+	return func(l *Limiter) { l.breaker = nil }
 }
 
 // New 构造限流器。prefix 用于隔离环境（dev / prod 共用一个 Redis 时不至于串味）。
@@ -197,7 +242,14 @@ type Limiter struct {
 // 参数类型是 redis.Scripter 而不是 UniversalClient：限流只用得到"执行 Lua"，
 // 收窄之后测试能注入假后端（见 Limiter.rdb 的注释）。*redis.Client 与
 // *redis.ClusterClient 都满足这个接口，调用方无需改动。
-func New(rdb redis.Scripter, prefix string, timeout time.Duration, failsClosed bool) *Limiter {
+//
+// # 熔断默认是开的
+//
+// 除非显式传 WithoutBreaker（测试用），New 会装配一个默认熔断器。
+// 理由见 breaker 字段与 circuitbreaker 包：没有它，"Redis 挂了"会退化成
+// "每个请求都慢上一次判定超时"—— 而 Decide 的降级只解决"失败怎么答"，
+// 不解决"还要不要每次都去试"。
+func New(rdb redis.Scripter, prefix string, timeout time.Duration, failsClosed bool, opts ...Option) *Limiter {
 	if prefix == "" {
 		prefix = "rl"
 	}
@@ -206,13 +258,18 @@ func New(rdb redis.Scripter, prefix string, timeout time.Duration, failsClosed b
 		// 而这里能发现"有人传了 0"这件事本身比默认值重要。
 		panic("ratelimit: timeout 必须为正数")
 	}
-	return &Limiter{
+	l := &Limiter{
 		rdb:         rdb,
 		prefix:      prefix,
 		timeout:     timeout,
 		failsClosed: failsClosed,
 		now:         time.Now,
+		breaker:     circuitbreaker.New(DefaultBreakerThreshold, DefaultBreakerOpenDuration),
 	}
+	for _, opt := range opts {
+		opt(l)
+	}
+	return l
 }
 
 // policy 是一个已解析的限流策略：走哪个 key 维度、用哪个窗口与阈值。
@@ -263,7 +320,7 @@ type Defaults struct {
 // subject 是主体标识：已登录请求传 user id，匿名请求传客户端 IP。
 // **不要**传原始 IP 之外的用户输入（手机号、token 等）：它们直接进 Redis key，
 // 可被用来在 key 空间里制造大量一次性条目。手机号这类标识要先哈希。
-func (l *Limiter) Allow(ctx context.Context, p Policy, subject string, def Defaults) (Result, error) {
+func (l *Limiter) Allow(ctx context.Context, p Policy, subject string, def Defaults) (res Result, err error) {
 	window, limit := p.Window, p.Limit
 	if window <= 0 {
 		window = def.Window
@@ -280,6 +337,61 @@ func (l *Limiter) Allow(ctx context.Context, p Policy, subject string, def Defau
 		return Result{}, errors.New("限流主体不能为空：空 key 会让所有匿名请求共用一个计数器")
 	}
 
+	// ★ 上面两条前置校验**刻意**排在熔断之前。
+	//
+	// 它们是配置/调用错误，不是后端故障。若也走熔断记账，一个漏配窗口的调用点
+	// 就能把熔断器"喂"到打开 —— 于是真正的 Redis 故障还没发生，限流已经全量降级。
+	// 判据：**只有真的碰过远端之后的失败**才算后端的证据。
+
+	// noConclusion 标记"这次调用拿不到结论"，专供下面的 defer 使用。
+	// 必须声明在函数作用域（而不是 breaker 分支内）：判定失败的那些 return 路径
+	// 在分支之外，它们要能写上这个标记。
+	//
+	// ★ 为什么用显式标记，而不是在 defer 里判 `errors.Is(err, context.DeadlineExceeded)`
+	//
+	// 那个写法**看着更简洁，实际是错的**，而且错的方向最坏（熔断器变聋）。
+	// 两条事实叠在一起就会误判：
+	//
+	//  1. BackendError 实现了 `Unwrap() error { return e.Cause }`，
+	//     所以 errors.Is(&BackendError{Cause: X}, X) 为 **true** —— 错误链会穿透到 Cause。
+	//  2. **内部** judgeCtx 超时时，go-redis 在池等待路径上原样返回 ctx.Err()
+	//     （v9 internal/pool/pool.go 的 waitTurn/queuedNewConn），
+	//     于是 Cause 恰好就是 context.DeadlineExceeded。
+	//
+	// 合起来：**内部判定超时**会被读成"调用方取消" → 走 Abort()（不下结论）→
+	// 不计失败 → 熔断器永远打不开。而"后端卡住 + 池被占满"正是熔断最该生效的
+	// 形态，也是它唯一要解决的问题。现象是"Redis 挂时整站持续变慢"，
+	// 没有报错、没有变红的测试，只有一条看起来更简洁的错误链判断。
+	//
+	// 判据只能是**调用方自己的 ctx**：只有它 Done 才说明"这次调用没有结论"。
+	// 内部超时是后端的证据，必须计入失败。
+	// （守卫：TestAllow_InternalJudgeTimeoutFeedsBreaker 的对照实验；
+	//   变异体 M63 把 noConclusion 写回错误链判断，必须被它抓住。）
+	noConclusion := false
+
+	if l.breaker != nil {
+		if berr := l.breaker.Allow(); berr != nil {
+			// 熔断打开：不碰 Redis，直接判定为后端不可用，交给 Decide 按
+			// failsClosed 决定放行还是拒绝。这就是熔断的全部价值 ——
+			// 让"Redis 挂了"不再等于"每个请求都多等一次判定超时"。
+			return Result{}, &BackendError{Cause: berr}
+		}
+		// 记账放在 defer 里：判定逻辑有**多个** return 路径
+		//（ctx 取消 / 脚本错误 / 返回形状异常 / 正常），任何一条漏记账都会让统计失真；
+		// 尤其半开期的探测若漏了，in-flight 标记会把熔断器永久卡住。
+		// 用具名返回值 err，defer 才能看到最终的结论。
+		defer func() {
+			switch {
+			case noConclusion:
+				l.breaker.Abort()
+			case err == nil:
+				l.breaker.Report(true)
+			default:
+				l.breaker.Report(false)
+			}
+		}()
+	}
+
 	// 判定自身的超时独立于调用方，见 Limiter.timeout。
 	//
 	// 注意它**不是**唯一防线：go-redis 在"连得上但不回话"时等的是
@@ -291,7 +403,10 @@ func (l *Limiter) Allow(ctx context.Context, p Policy, subject string, def Defau
 	defer cancel()
 
 	now := l.now()
-	res, err := slidingWindowScript.Run(judgeCtx, l.rdb,
+	// 局部变量刻意避开 res/err（它们是具名返回值）：用 := 会**遮蔽**外层，
+	// 那样 defer 里的熔断记账永远看到 err==nil —— 熔断器成了聋子，
+	// 而现象只是"熔断器从不打开"，不报任何错。
+	raw, runErr := slidingWindowScript.Run(judgeCtx, l.rdb,
 		[]string{l.key(p, subject)},
 		window.Milliseconds(),
 		limit,
@@ -299,7 +414,7 @@ func (l *Limiter) Allow(ctx context.Context, p Policy, subject string, def Defau
 		now.UnixMilli(),
 	).Slice()
 
-	if err != nil {
+	if runErr != nil {
 		// 刻意**不**把 err 原样上抛给 HTTP 层：Redis 的错误原文含内网地址与
 		// 拓扑信息（"dial tcp 10.0.3.11:6379: connect: connection refused"），
 		// 外泄等于给攻击者画地图。
@@ -311,17 +426,22 @@ func (l *Limiter) Allow(ctx context.Context, p Policy, subject string, def Defau
 		if ctx.Err() != nil {
 			// 调用方自己取消了（客户端已断开 / HTTP 超时）。这不算后端故障，
 			// 也不该被算成"限流失败"而触发降级 —— 直接上抛调用方的 ctx 错误。
+			//
+			// 判据刻意用 ctx.Err()（**调用方**的 ctx）而不是 runErr：
+			// 内部 judgeCtx 超时也可能是 context.DeadlineExceeded，
+			// 那是后端的证据，必须计入熔断失败。详见 noConclusion 的注释。
+			noConclusion = true
 			return Result{}, ctx.Err()
 		}
-		return Result{}, &BackendError{Cause: err}
+		return Result{}, &BackendError{Cause: runErr}
 	}
-	if len(res) != 3 {
-		return Result{}, fmt.Errorf("%w: Lua 返回了 %d 个值，期望 3 个", ErrBackendUnavailable, len(res))
+	if len(raw) != 3 {
+		return Result{}, fmt.Errorf("%w: Lua 返回了 %d 个值，期望 3 个", ErrBackendUnavailable, len(raw))
 	}
 
-	count, ok1 := res[0].(int64)
-	allowed, ok2 := res[1].(int64)
-	oldestAt, ok3 := res[2].(int64)
+	count, ok1 := raw[0].(int64)
+	allowed, ok2 := raw[1].(int64)
+	oldestAt, ok3 := raw[2].(int64)
 	if !ok1 || !ok2 || !ok3 {
 		return Result{}, fmt.Errorf("%w: Lua 返回值类型异常", ErrBackendUnavailable)
 	}
@@ -387,16 +507,26 @@ func (l *Limiter) FailsClosed() bool { return l.failsClosed }
 // 把它调到 300ms 会让跨机房 Redis 上的 refresh 轮换误超时 ——
 // 那是一个会被误判成"用户被登出"的故障。
 //
-// 代价是多一个连接池（默认 20 条连接）。这个数字对本组件是合适的：
-// 它只需要承载准入判定的并发，而准入判定本身已经被限流阈值卡住了。
-func NewDedicatedRedis(addr, password string, db int, timeout time.Duration) *redis.Client {
+// DefaultDedicatedPoolSize 是限流专用 Redis 池的默认大小。
+//
+// 依据见 config.RateLimitRedisPoolSize：本机独立实验里池 10→100 吞吐 2.8 倍，
+// 100 之后饱和（Redis 单线程已满）。
+const DefaultDedicatedPoolSize = 100
+
+// poolSize 决定"同时在飞的准入判定数"。它曾经写死 10，理由是"准入通道不需要吞吐"——
+// 那个判断在一次往返约 300µs 的部署里是错的：准入判定是每个请求都要做的必答题，
+// 池大小直接卡住了它的吞吐（实测 2.8 倍差距）。而"连接多会让后端故障时更多请求
+// 卡在同一个坏对端上"这个原本成立的顾虑，现在由熔断接管 ——
+// 打开之后根本不碰 Redis，与池里有多少连接无关。
+func NewDedicatedRedis(addr, password string, db int, timeout time.Duration, poolSize int) *redis.Client {
+	if poolSize <= 0 {
+		poolSize = DefaultDedicatedPoolSize
+	}
 	return redis.NewClient(&redis.Options{
-		Addr:     addr,
-		Password: password,
-		DB:       db,
-		// 池子刻意小：这是准入通道，不需要吞吐。连接多只会让后端故障时
-		// 更多请求一起卡在同一个不可用的对端上。
-		PoolSize:     10,
+		Addr:         addr,
+		Password:     password,
+		DB:           db,
+		PoolSize:     poolSize,
 		MinIdleConns: 2,
 
 		// 这三个是真正把单次判定钉在 timeout 上的参数。

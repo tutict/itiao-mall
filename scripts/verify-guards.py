@@ -392,8 +392,11 @@ MUTATIONS: list[Mutation] = [
         # 锚点在 2026-10-10 的 P2-6 加固后从 `fmt.Errorf("%w: %v", ...)` 换成
         # `&BackendError{Cause: err}`（原文不再拼进 Error()）。变异语义不变：
         # 都是"让 errors.Is(err, ErrBackendUnavailable) 不成立"。
-        old="return Result{}, &BackendError{Cause: err}",
-        new="return Result{}, fmt.Errorf(\"限流后端异常: %v\", err)",
+        #
+        # 2026-10-11 第五轮：接入熔断时把判定里的局部变量从 err 改名成 runErr
+        # （避免遮蔽具名返回值 —— 见 ratelimit.Allow 的注释），锚点随之更新。
+        old="return Result{}, &BackendError{Cause: runErr}",
+        new="return Result{}, fmt.Errorf(\"限流后端异常: %v\", runErr)",
         # 注意期望的测试换了：原来写的是 TestAllow_DoesNotLeakBackendAddress，
         # 但那条守卫**抓不住**这个变异 —— 新错误里依然用 %v 带了原始错误，
         # 泄露程度与改之前一样（都取决于 dial 失败的形态）。
@@ -694,8 +697,8 @@ MUTATIONS: list[Mutation] = [
     Mutation(
         ident="M41 后端错误原文重新拼进 Error()（地址随任何误用点外泄）",
         rel_path="services/api/internal/ratelimit/ratelimit.go",
-        old="return Result{}, &BackendError{Cause: err}",
-        new="return Result{}, fmt.Errorf(\"%w: %v\", ErrBackendUnavailable, err)",
+        old="return Result{}, &BackendError{Cause: runErr}",
+        new="return Result{}, fmt.Errorf(\"%w: %v\", ErrBackendUnavailable, runErr)",
         expect_fail=["TestAllow_DoesNotLeakBackendAddress"],
         why="这正是加固前的形态：注释承诺「不把 err 原样上抛」，实现却把 Redis 原文"
         "（dial tcp 10.0.3.11:6379 ...）拼进了 Error()。当前它到不了客户端，"
@@ -841,6 +844,215 @@ MUTATIONS: list[Mutation] = [
         "下游 httppprof.Profile 读的是 r.FormValue(\"seconds\")，"
         "只改局部变量的话下游拿到的仍是原始请求值 —— 那样这个变异体描述的后果不成立。"
         "写变异体前先问「它描述的后果真的会发生吗」（M36 曾栽在这上面）。",
+    ),
+
+    # =====================================================================
+    # 第五轮：高并发资源耗尽面（连接上限 / 并发闸门 / 熔断 / 容量配置）
+    # =====================================================================
+    Mutation(
+        ident="M51 连接上限对非法值静默兜底",
+        rel_path="services/api/internal/platform/connlimit/listener.go",
+        old='\tif n <= 0 {\n\t\tpanic("connlimit: 连接上限必须为正数（0/负数会静默变成\'不限\'）")\n\t}',
+        new='\tif n <= 0 {\n\t\tn = 1 << 30\n\t}',
+        expect_fail=["TestNewLimitListener_RejectsNonPositive"],
+        why="传 0/负数时静默换成一个极大的值，等于「以为设了连接上限、实际没有」。"
+        "调用点几乎总是从配置里读到了空值，而这类失效**不会自己暴露**："
+        "服务照常启动、压测照常通过，只在被慢速攻击抽干 fd 的那天才显形。",
+        note="判据是「非法输入必须响」，不是「非法输入被换算成某个合理值」—— "
+        "后者是更危险的实现，因为它把配置事故伪装成了正常行为。",
+    ),
+    Mutation(
+        ident="M52 连接关闭时不归还槽位",
+        rel_path="services/api/internal/platform/connlimit/listener.go",
+        old='\tc.releaseOnce.Do(c.release)',
+        new='\tc.releaseOnce.Do(func() {})',
+        expect_fail=["TestLimitListener_CapsConcurrentConns"],
+        why="槽位只借不还 ⇒ 连接上限会在**第一次**被占满之后永久卡死："
+        "现象是「服务活着但再也不接受新连接」，与进程假死难以区分。"
+        "它是这个组件最容易被写漏的一行 —— 占槽那半显眼，还槽那半藏在 Close 里。",
+        note="用 releaseOnce 而不是直接 release 是另一个独立风险（重复 Close 会归还两次、"
+        "把上限慢慢放大）。本条只盖「不归还」这个方向；两条都在测试里各有断言。",
+    ),
+    Mutation(
+        ident="M53 探针豁免表被顺带扩大",
+        rel_path="services/api/internal/httpapi/concurrency.go",
+        old='var probeExemptPaths = map[string]struct{}{\n\t"/healthz": {},\n\t"/readyz":  {},\n}',
+        new='var probeExemptPaths = map[string]struct{}{\n\t"/healthz": {},\n\t"/readyz":  {},\n\t"/metrics": {},\n}',
+        expect_fail=["TestProbeExemptPaths_IsExactlyTheExpectedSet"],
+        why="豁免表每多一条，就多一个「过载时仍然无条件放行」的路径。"
+        "加一条的动机总是合理的（metrics 看着就该放行），而后果是那段路径"
+        "在系统被压垮时依然照单全收 —— 容量闸门对它形同不存在。",
+        note="★ 这条守卫必须是**静态**断言（名单写死在测试里），不能遍历 probeExemptPaths 自身。"
+        "遍历式断言 = 白名单给自己作证：表扩容时它照样绿。这正是 M48 踩过的形态。",
+    ),
+    Mutation(
+        ident="M54 探针豁免写成前缀匹配",
+        rel_path="services/api/internal/httpapi/concurrency.go",
+        old='\t_, ok := probeExemptPaths[r.URL.Path]\n\treturn ok',
+        new='\tp := r.URL.Path\n'
+            '\treturn (len(p) >= 8 && p[:8] == "/healthz") || (len(p) >= 7 && p[:7] == "/readyz")',
+        expect_fail=["TestConcurrencyGate_DoesNotExemptLookalikePaths"],
+        why="前缀匹配会让 /healthzz、/healthz/extra、/readyz/admin 一并放行。"
+        "它比「表里多加一条」更隐蔽：表本身没变，评审时看到的还是那两条，"
+        "但匹配规则已经宽了 —— 将来任何以这两个前缀开头的接口都自动免疫闸门。",
+        note="这是铁律 20 的形态：只测「该放行的放行了」抓不到「掩码写宽」。"
+        "测试里逐条列了形近路径（/healthzz、/healthz/extra、/readyz/admin、/health）"
+        "作为边界外侧的放行断言。"
+        "\n\n★ 2026-10-11 四轴 review：这条的锚点原本是调用点的 "
+        "`if _, ok := probeExemptPaths[r.URL.Path]; ok {`，"
+        "而那次把判定收进了 isProbeExempt（为了让「拿路径的哪个字段」有单一改动点，见 M64），"
+        "锚点随之失配 —— `--audit` 立刻报「命中 0 次」。"
+        "这正是它该有的表现：**重构会让锚点失效，而失效必须是响的**，"
+        "否则这条会变成恒为「未证明」的假条目。现已改钉到函数体。",
+    ),
+    Mutation(
+        ident="M55 闸门拒绝重新变成逐条 Error 日志",
+        rel_path="services/api/internal/httpapi/response.go",
+        old='\treturn !errors.Is(err, domain.ErrServiceOverloaded)',
+        new='\treturn true',
+        expect_fail=["TestShouldLogAsError"],
+        why="闸门拒绝是过载时**按请求频率**产生的 5xx。重新对每一条都记 Error，"
+        "日志量就正比于请求量 —— 而日志 I/O 正是故障时最该省下的资源："
+        "磁盘写满会让服务从「降级但仍可用」变成「彻底不可用」。"
+        "注意它把闸门「刻意排在访问日志之前」的那个安排从侧门绕过了。",
+        note="守卫必须带**正控制**（普通 5xx 仍要记）：只断言「过载不记」的话，"
+        "把函数写成恒 false 也能通过，而后果是所有真故障都静默。",
+    ),
+    Mutation(
+        ident="M56 闸门拒绝回 429 而不是 503",
+        rel_path="services/api/internal/httpapi/concurrency.go",
+        old='\t\t\t\tWriteProblem(w, r, domain.ErrServiceOverloaded)',
+        new='\t\t\t\tWriteProblem(w, r, domain.ErrRateLimited)',
+        expect_fail=["TestConcurrencyGate_RejectsBeyondLimit"],
+        why="429 的含义是「**你**请求太多」，503 是「**我**这边不行了」。"
+        "把容量问题答成 429，客户端就会按「等一秒重试」处理一个只有扩容"
+        "才能解决的问题，而且永远不会把它当容量信号上报 —— "
+        "故障表现正常、根因被永久掩盖。",
+        note="两个码都能「挡住请求」，所以只断言「被拦住」的测试抓不到这条。"
+        "必须断言具体的状态码。",
+    ),
+    Mutation(
+        ident="M57 限流器不再检查熔断",
+        rel_path="services/api/internal/ratelimit/ratelimit.go",
+        old='\tif l.breaker != nil {\n\t\tif berr := l.breaker.Allow(); berr != nil {',
+        new='\tif false {\n\t\tif berr := l.breaker.Allow(); berr != nil {',
+        expect_fail=["TestAllow_BreakerStopsHittingBackend"],
+        why="熔断器的**全部价值**在于「打开之后不再去试」。不检查它，"
+        "就退化成「每个请求仍然付一次判定超时」—— 而 Decide 的降级逻辑"
+        "只解决「失败怎么答」，从来没解决「还要不要每次都去试」。"
+        "现象是 Redis 挂掉期间整站持续变慢，且没有任何报错指向这里。",
+        note="这条守卫必须**数后端调用次数**，不能只断言返回值。"
+        "一个「每次都去试、试完照样返回错误」的实现能让所有返回值断言通过，"
+        "而它一秒钟资源都没省下来。",
+    ),
+    Mutation(
+        ident="M58 调用方取消被计入熔断失败",
+        rel_path="services/api/internal/ratelimit/ratelimit.go",
+        old='\t\t\t\tl.breaker.Abort()',
+        new='\t\t\t\tl.breaker.Report(false)',
+        expect_fail=["TestAllow_CallerCancelDoesNotFeedBreaker"],
+        why="ctx 取消（客户端断开、上游超时）拿不到结论，不是「后端不可用」的证据。"
+        "把它记成失败之后，一次客户端集体重连就足以把熔断器喂开 —— "
+        "好端端的 Redis 被自己的客户端挤下线，而且恢复要等一整个冷却周期。",
+        note="Abort 的存在还有第二个理由：不撤销半开期的探测位，"
+        "那个被取消的探测会把熔断器永久卡在半开（测试 TestBreaker_AbortUnsticksHalfOpen 覆盖）。",
+    ),
+    Mutation(
+        ident="M59 前置校验也喂熔断",
+        rel_path="services/api/internal/ratelimit/ratelimit.go",
+        old='\t\treturn Result{}, fmt.Errorf("%w: 窗口与阈值必须为正数", ErrBackendUnavailable)',
+        new='\t\tif l.breaker != nil {\n\t\t\tl.breaker.Report(false)\n\t\t}\n\t\treturn Result{}, fmt.Errorf("%w: 窗口与阈值必须为正数", ErrBackendUnavailable)',
+        expect_fail=["TestAllow_PrecheckDoesNotFeedBreaker"],
+        why="「窗口/阈值缺省」是配置错误，不是后端故障。让它也走熔断记账，"
+        "一个漏配窗口的调用点就能把熔断器喂到打开 —— 真实的 Redis 故障还没发生，"
+        "限流已经全量降级了。判据：**只有真的碰过远端之后的失败**才算后端的证据。",
+        note="这条很容易在重构时被破坏：把 breaker 检查上移到函数最前面"
+        "（「越早越好」的直觉）就会顺带把前置校验圈进去。",
+    ),
+    Mutation(
+        ident="M60 并发闸门的默认值被改成 0",
+        rel_path="services/api/internal/config/config.go",
+        old='\tMaxInflightRequests int `env:"MAX_INFLIGHT_REQUESTS" envDefault:"2048"`',
+        new='\tMaxInflightRequests int `env:"MAX_INFLIGHT_REQUESTS" envDefault:"0"`',
+        expect_fail=["TestDefaults_AreProtective"],
+        why="0 是「显式关闭」的合法取值，所以这条改动**不会让任何边界测试变红**，"
+        "服务照常启动、压测照常绿 —— 只有 TestDefaults_AreProtective 这种"
+        "专门断言「默认必须为正」的测试能抓住它。而它描述的后果是："
+        "所有未显式配置的部署都在裸奔。",
+        note="容量保护最可能的失效方式不是配错值，而是默认值被悄悄改成 0/关闭。"
+        "所以要有一条把「默认必须为正」写死的断言，且它必须用 unsetEnv 读**真默认值**"
+        "（baseEnv 显式设过的值会盖住它）。",
+    ),
+    Mutation(
+        ident="M61 熔断器半开期不再独占探测",
+        rel_path="services/api/internal/platform/circuitbreaker/breaker.go",
+        old='\tcase StateHalfOpen:\n\t\tif b.halfOpenInFlight {\n\t\t\treturn ErrOpen\n\t\t}\n\t\tb.halfOpenInFlight = true\n\t\treturn nil',
+        new='\tcase StateHalfOpen:\n\t\treturn nil',
+        expect_fail=["TestBreaker_HalfOpenAllowsSingleProbeAndClosesOnSuccess"],
+        why="半开期放行所有调用 = 冷却一到就给依赖一次全量冲击。"
+        "故障常常就是这么被「试探性流量」二次打垮的 —— 恢复期本身也该是渐进的。",
+        note="halfOpenInFlight 字段是这个不变式的载体。去掉它之后代码依然编译、"
+        "状态机看起来也「对」，只有「只放一个」这条断言会红。",
+    ),
+    Mutation(
+        ident="M62 熔断器成功时不重置失败计数",
+        rel_path="services/api/internal/platform/circuitbreaker/breaker.go",
+        old='\t\tif success {\n\t\t\tb.failures = 0\n\t\t\treturn\n\t\t}\n\t\tb.failures++',
+        new='\t\tif success {\n\t\t\treturn\n\t\t}\n\t\tb.failures++',
+        expect_fail=["TestBreaker_SuccessResetsFailureCount"],
+        why="不重置就变成「累计失败」而非「连续失败」：一个 50% 失败率的抖动依赖"
+        "（其实还能用）迟早会攒够阈值被熔断 —— 那是自伤，且概率随运行时长单调上升。",
+        note="「连续」还是「累计」是一句话的差别，日志与状态机都看不出区别，"
+        "只有交错成功/失败的序列能把它区分出来。",
+    ),
+
+    # =====================================================================
+    # 2026-10-11 四轴 review 挖出的两条真缺陷 —— 给它们的守卫配的变异体
+    # =====================================================================
+    Mutation(
+        ident="M63 内部判定超时被改回「按错误链」判成调用方取消",
+        rel_path="services/api/internal/ratelimit/ratelimit.go",
+        old='\t\t\tcase noConclusion:\n\t\t\t\tl.breaker.Abort()',
+        new='\t\t\tcase noConclusion || errors.Is(err, context.DeadlineExceeded):\n'
+            '\t\t\t\tl.breaker.Abort()',
+        expect_fail=["TestAllow_InternalJudgeTimeoutFeedsBreaker"],
+        why="这正是 review 前的形态，而且它**看着更简洁**（少一个变量、少一行赋值），"
+        "所以很容易被后来的人「顺手简化」回去。它错在两件事叠加："
+        "BackendError.Unwrap() 会把 Cause 透出来，而**内部** judgeCtx 超时时 "
+        "go-redis 在池等待路径上原样返回 ctx.Err()（context.DeadlineExceeded）。"
+        "于是内部判定超时被读成「调用方取消」→ 走 Abort() 不计失败 → "
+        "熔断器对**最主要的**故障形态（后端卡住 + 池被占满）永远打不开。"
+        "现象是「Redis 挂时整站持续变慢」，没有报错、没有日志指向这里。"
+        "行为上它与原形态等价：三处分支的走向完全一致"
+        "（真取消时 noConclusion 为真、原始形态走第二个 clause，同样到 Abort）。",
+        note="★ 指定的守卫必须是 TestAllow_InternalJudgeTimeoutFeedsBreaker，"
+        "不能是 TestAllow_CallerCancelDoesNotFeedBreaker —— 后者在错误链写法下"
+        "**照样通过**（真取消走哪条分支都对）。这正是「单侧用例挡不住语义反转」："
+        "一个「把所有失败都当无结论」的实现能通过全部取消用例，"
+        "而它的后果是熔断形同不存在。所以两侧各有一条守卫，缺一不可。"
+        "\n\n★ 这条变异体第一版写成了原形态（把 `noConclusion` 整个换成两条"
+        " errors.Is 的 case），结果**编译不过** —— 变量变成「声明未使用」。"
+        "harness 如实报的是「只有包级失败，没有具名测试」，而不是「抓住」。"
+        "这正是方法论里那条：写变异体先问「它还能被编译吗」，"
+        "再问「它描述的后果真的会发生吗」。多带 `noConclusion ||` 一项之后"
+        "既保住了编译，又与原形态行为等价。",
+    ),
+    Mutation(
+        ident="M64 探针豁免改回只看 r.URL.Path（放过百分号编码变体）",
+        rel_path="services/api/internal/httpapi/concurrency.go",
+        old='\tif r.URL.RawPath != "" {\n\t\treturn false\n\t}',
+        new='\tif false {\n\t\treturn false\n\t}',
+        expect_fail=["TestConcurrencyGate_DoesNotExemptPercentEncodedVariants"],
+        why="net/http 对 `/%68ealthz` 给出 Path=\"/healthz\" + RawPath=\"/%68ealthz\"，"
+        "而 chi 路由用的是 RawPath（非空时优先）⇒ chi 找不到 /healthz 这条路由、回 404。"
+        "只看 Path 的话，这类请求**拿到闸门豁免却没有走到探针**："
+        "既绕过容量闸门，又落进被刻意排在闸门**内层**的 AccessLog —— "
+        "于是「过载时每个被拒请求不写日志」这个安排被从侧门打开，"
+        "攻击者用编码变体刷请求就能既不被限并发、又持续产生日志。",
+        note="这条与 M53（豁免表被扩大）、M54（豁免写成前缀匹配）是**三个不同的方向**："
+        "M53 改的是「表里有哪些项」，M54 改的是「怎么比较」，"
+        "M64 改的是「拿路径的哪个字段」。三条各自的守卫不可互相替代 —— "
+        "LookalikePaths 那条在 M64 下照样全绿（那些路径的 Path 本来就不匹配）。",
     ),
 ]
 

@@ -55,6 +55,13 @@ type Deps struct {
 
 	// MaxBodyBytes 是请求体上限。≤0 时用 DefaultMaxBodyBytes。
 	MaxBodyBytes int64
+
+	// MaxInflightRequests 是同时在处理中的请求数上限（并发准入闸门）。
+	// ≤0 表示不启用闸门（那是显式关闭）。
+	//
+	// 与 MaxBodyBytes 一样，上限值本身不是安全边界而是**容量边界**，
+	// 所以它由调用方（cmd 层读配置）决定，不由本层写死。
+	MaxInflightRequests int
 }
 
 // NewRouter 组装路由与中间件链。
@@ -85,6 +92,22 @@ func NewRouter(d Deps) http.Handler {
 	// 安全响应头放在最外层之一：连 Recoverer 的 500、CORS 的 204 预检响应
 	// 也要带上这些头。越靠前，覆盖面越大。
 	r.Use(SecurityHeaders)
+	// 并发准入闸门。位置有两层讲究：
+	//
+	//  1. 在 SecurityHeaders **之内**：闸门回 503 时安全头也要在（否则
+	//     "过载时的响应"成了一种没有 nosniff 的响应，形状与正常响应不一致）。
+	//  2. 在 AccessLog **之外**：被闸门拒绝的请求不写访问日志。这不是为了省事 ——
+	//     过载时若每个被拒请求都落一行日志，日志（磁盘）会成为下一个被抽干的资源，
+	//     一场拒绝风暴能把服务彻底打挂。拒绝行为的可观测性改由闸门自己的两条日志
+	//     提供，且**都不按请求记**：过载告警按时间节流（每 10 秒至多一条）、
+	//     恢复只记一条（CAS）。与"过载时长 / 过载事件次数"成正比而非与请求数成正比。
+	//
+	// 它又在 authGate / rateLimitGate / merchantStatusGate **之前**：这三层里的后两层
+	// 一个要连 Redis、一个要查 PG，正是过载时最紧张的资源 —— 闸门必须先把入口
+	// 并发钉住，它们才不会被压垮。
+	if d.MaxInflightRequests > 0 {
+		r.Use(ConcurrencyGate(d.MaxInflightRequests, time.Second))
+	}
 	r.Use(AccessLog(d.Logger))
 	r.Use(Recoverer)
 	r.Use(chimw.RealIP)

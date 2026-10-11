@@ -17,6 +17,7 @@ import (
 	"github.com/tutic/itiao-mall/services/api/internal/httpapi"
 	"github.com/tutic/itiao-mall/services/api/internal/payment"
 	"github.com/tutic/itiao-mall/services/api/internal/platform/cache"
+	"github.com/tutic/itiao-mall/services/api/internal/platform/connlimit"
 	"github.com/tutic/itiao-mall/services/api/internal/platform/logging"
 	"github.com/tutic/itiao-mall/services/api/internal/platform/migrate"
 	"github.com/tutic/itiao-mall/services/api/internal/platform/postgres"
@@ -80,6 +81,7 @@ func runMigrate(cfg *config.Config, logger *slog.Logger) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
+	// 迁移只用一两条连接，不需要按服务负载配池。
 	pool, err := postgres.New(ctx, cfg.DatabaseURL)
 	if err != nil {
 		return err
@@ -102,13 +104,14 @@ func runServe(cfg *config.Config, logger *slog.Logger) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	pool, err := postgres.New(ctx, cfg.DatabaseURL)
+	pool, err := postgres.New(ctx, cfg.DatabaseURL, postgres.WithMaxConns(cfg.PGMaxConns))
 	if err != nil {
 		return err
 	}
 	defer pool.Close()
 
-	rdb, err := cache.New(ctx, cfg.RedisAddr, cfg.RedisPass, cfg.RedisDB)
+	rdb, err := cache.New(ctx, cfg.RedisAddr, cfg.RedisPass, cfg.RedisDB,
+		cache.WithPoolSize(cfg.RedisPoolSize))
 	if err != nil {
 		return err
 	}
@@ -131,10 +134,12 @@ func runServe(cfg *config.Config, logger *slog.Logger) error {
 		// （为 refresh 轮换定的），共用它会让限流在 Redis 卡顿时
 		// 把每个请求拖满 3 秒 —— 准入控制反而成了最大的一笔延迟。
 		rlRedis := ratelimit.NewDedicatedRedis(
-			cfg.RedisAddr, cfg.RedisPass, cfg.RedisDB, cfg.RateLimitTimeout)
+			cfg.RedisAddr, cfg.RedisPass, cfg.RedisDB, cfg.RateLimitTimeout,
+			cfg.RateLimitRedisPoolSize)
 		defer func() { _ = rlRedis.Close() }()
 
-		limiter = ratelimit.New(rlRedis, "rl:"+cfg.AppEnv, cfg.RateLimitTimeout, cfg.RateLimitFailsClosed())
+		limiter = ratelimit.New(rlRedis, "rl:"+cfg.AppEnv, cfg.RateLimitTimeout, cfg.RateLimitFailsClosed(),
+			ratelimit.WithBreaker(cfg.RateLimitBreakerThreshold, cfg.RateLimitBreakerOpen))
 		logger.Info("限流已启用",
 			slog.Bool("fails_closed", cfg.RateLimitFailsClosed()),
 			slog.Int("readwrite_limit", cfg.RateLimitMax),
@@ -142,6 +147,9 @@ func runServe(cfg *config.Config, logger *slog.Logger) error {
 			slog.Int("auth_limit", cfg.RateLimitAuthMax),
 			slog.String("auth_window", cfg.RateLimitAuthWindow.String()),
 			slog.String("judge_timeout", cfg.RateLimitTimeout.String()),
+			slog.Int("redis_pool_size", cfg.RateLimitRedisPoolSize),
+			slog.Int("breaker_threshold", cfg.RateLimitBreakerThreshold),
+			slog.String("breaker_open", cfg.RateLimitBreakerOpen.String()),
 		)
 	} else {
 		logger.Warn("限流已关闭：登录接口将没有频率限制，仅可用于本地开发")
@@ -202,6 +210,8 @@ func runServe(cfg *config.Config, logger *slog.Logger) error {
 		CORSOrigins:    cfg.CORSOrigins(),
 		CORSAllowLocal: cfg.CORSAllowLocalhost(),
 		MaxBodyBytes:   cfg.MaxBodyBytes,
+
+		MaxInflightRequests: cfg.MaxInflightRequests,
 	})
 
 	srv := &http.Server{
@@ -218,6 +228,18 @@ func runServe(cfg *config.Config, logger *slog.Logger) error {
 	}
 
 	errCh := make(chan error, 1)
+
+	// 显式 Listen 而不是 ListenAndServe：需要一个 listener 句柄来包**连接数上限**。
+	// 走 ListenAndServe 的话 net/http 自己建 listener，我们拿不到它，
+	// 上限就无处可加 —— 而 Go 的 http.Server 本身没有这个能力。
+	ln, err := net.Listen("tcp", cfg.HTTPAddr)
+	if err != nil {
+		return fmt.Errorf("监听 %s 失败: %w", cfg.HTTPAddr, err)
+	}
+	if cfg.MaxConns > 0 {
+		ln = connlimit.NewLimitListener(ln, cfg.MaxConns)
+	}
+
 	go func() {
 		logger.Info("HTTP 服务已启动",
 			slog.String("addr", cfg.HTTPAddr),
@@ -225,8 +247,12 @@ func runServe(cfg *config.Config, logger *slog.Logger) error {
 			slog.String("auth_provider", cfg.AuthProvider),
 			slog.String("payment_provider", cfg.PaymentProvider),
 			slog.String("version", version),
+			slog.Int("max_conns", cfg.MaxConns),
+			slog.Int("max_inflight_requests", cfg.MaxInflightRequests),
 		)
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		// Serve 而不是 ListenAndServe：listener 已经建好（并被上限包装过），
+		// Serve 不会重新监听。Shutdown 时 Serve 会返回 http.ErrServerClosed。
+		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- err
 		}
 	}()
