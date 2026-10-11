@@ -758,6 +758,90 @@ MUTATIONS: list[Mutation] = [
         "两处是互补关系而不是重复：精确匹配管裸名，后缀表管子域 —— "
         "所以只测「localhost 被拒」是覆盖不到这条的。",
     ),
+    Mutation(
+        ident="M46 生产环境的剖析端口不再校验回环",
+        rel_path="services/api/internal/config/config.go",
+        old="\tif !c.IsProd() || c.AllowPublicPprofInProd {\n\t\treturn nil\n\t}\n\tif profiling.IsLoopbackAddr(c.PprofAddr) {\n\t\treturn nil\n\t}",
+        new="\tif true {\n\t\treturn nil\n\t}\n\tif profiling.IsLoopbackAddr(c.PprofAddr) {\n\t\treturn nil\n\t}",
+        expect_fail=["TestValidate_PprofRejectedInProd"],
+        why="校验被短路后，生产环境写 `PPROF_ADDR=:6060` 就能起端口。"
+        "而空 host 在 Go 里绑的是通配地址（所有网卡）—— 形状最像「本机端口」，实际全网可达。"
+        "剖析端点可以读到进程内存：heap/allocs 带出分配点参数内容，"
+        "goroutine?debug=2 带出每个协程的完整栈。"
+        "危险形态与 validateMockProviders 同构：服务照常启动，没有任何测试变红。",
+        note="只测「非回环被拒」不够 —— 还要有「回环被放行」的正控制（表里已含），"
+        "否则一个「一律拒绝」或「一律放行」的坏实现都能让拒绝用例全绿。",
+    ),
+    Mutation(
+        ident="M47 剖析端点回环判定把空 host 当作本机",
+        rel_path="services/api/internal/platform/profiling/profiling.go",
+        old='\thost = strings.TrimSpace(host)\n\thost = strings.Trim(host, "[]")\n\tif host == "" {\n\t\treturn false\n\t}',
+        new='\thost = strings.TrimSpace(host)\n\thost = strings.Trim(host, "[]")\n\tif host == "" {\n\t\treturn true\n\t}',
+        expect_fail=["TestIsLoopbackAddr_AdjacentBoundaries"],
+        why="这条是 M46 的放大器：生产校验唯一依赖 IsLoopbackAddr，"
+        "它一旦把空 host 判成回环，M46 那条短路就等于默认放行。"
+        "两处都要有 —— 同一不变式在 N 处实现时只堵一处等于没堵。",
+        note="本条与 M46 的区别：M46 让校验不执行，本条让校验执行了但判错。"
+        "只堵一条的话，另一个方向的坏实现仍然能通过。",
+    ),
+    Mutation(
+        ident="M48 剖析端点把 cmdline 挂进白名单",
+        rel_path="services/api/internal/platform/profiling/profiling.go",
+        old='var profiles = []string{\n\t"allocs",',
+        new='var profiles = []string{\n\t"cmdline",\n\t"allocs",',
+        expect_fail=["TestProfiles_NoForbiddenNameIsMounted"],
+        why="cmdline 会把整个进程命令行原样吐出，"
+        "而本服务的命令行参数里可能有 DATABASE_URL（含数据库密码）与 JWT_SECRET。"
+        "它是 Go 标准 pprof 五件套（profile/trace/cmdline/symbol/index）之一，"
+        "所以「顺手把它也挂上」是一个极其自然的错误 —— "
+        "而挂上之后端点完全正常，不会有任何报错。",
+        note="trace 与 symbol 同样危险但没单独立变异：它们与 cmdline 走同一条注册路径"
+        "（都在 profiles 切片里），一条变异即覆盖三者。"
+        "\n\n★ 这条第一次跑时是**未证明**，而它抓得住的原因是个陷阱。"
+        "最初指定的是 TestHandler_UnknownProfileIsNotReachable（运行时判 404），"
+        "但它**不会红** —— 因为 pprof.Handler(\"cmdline\") 内部 Lookup 返回 nil，"
+        "端点自己就回 404，与「没注册」外表一模一样。"
+        "实际抓住它的是另一条遍历 ProfileNames() 的测试（它把 cmdline 算作「应该可用」），"
+        "于是统计出来是「红了但不是指定测试」＝ 未证明。"
+        "\n两个错叠在一起：(1) 守卫只靠运行时行为判定，而那个行为恰好与正确状态同形；"
+        "(2) 另一条测试遍历了实现自己的清单，等于白名单给自己作证。"
+        "修法是加静态断言 TestProfiles_NoForbiddenNameIsMounted —— "
+        "「白名单里出现 cmdline」这个事实本身就是要守的不变式，不该依赖运行时巧合。"
+        "**遍历实现自己的清单来验证它自己，是铁律 20 那个形态。**",
+    ),
+    Mutation(
+        ident="M49 剖析端点用 pprof.Handler(\"profile\") 注册 CPU profile",
+        rel_path="services/api/internal/platform/profiling/profiling.go",
+        old='mux.Handle("/debug/pprof/profile", guardSeconds(maxSeconds, http.HandlerFunc(httppprof.Profile)))',
+        new='mux.Handle("/debug/pprof/profile", guardSeconds(maxSeconds, httppprof.Handler("profile")))',
+        expect_fail=["TestHandler_CPUProfileActuallyWorks"],
+        why="这是本轮实测踩到的真坑：pprof.Handler 内部做 pprof.Lookup(name)，"
+        "而 \"profile\" 不是 runtime/pprof 里的伪 profile（Lookup 返回 nil）⇒ 端点回 404。"
+        "失败形态极隐蔽：heap/goroutine/allocs 全部 200 且有数据，"
+        "唯独最需要的 CPU profile 是 404 —— 而 404 在一次仓促排障里"
+        "很容易被读成「这个端点没开」，结论就变成「我们没有 CPU profiling 能力」。"
+        "直觉写法（遍历白名单统一用 pprof.Handler）恰好就是这个错误。",
+        note="守卫的判据是「能否解出 CPU profile 的语义标记」而不是「状态码是否 200」—— "
+        "只断言 200 的话，404 这个失败形态压根抓不到；"
+        "反过来第一版断言的是「首字节魔数 0x0A」，那是猜的（实测 0x48），已改成语义字符串断言。",
+    ),
+    Mutation(
+        ident="M50 剖析端点的采集时长上限被静默钳制而非拒绝",
+        rel_path="services/api/internal/platform/profiling/profiling.go",
+        old="\t\tif sec > maxSeconds {\n\t\t\thttp.Error(w,",
+        new="\t\tif sec > maxSeconds {\n\t\t\tsec = maxSeconds\n\t\t\tr.URL.RawQuery = \"seconds=\" + strconv.Itoa(sec)\n\t\t}\n\t\tif false {\n\t\t\thttp.Error(w,",
+        expect_fail=["TestGuardSeconds_RejectsOverLimit"],
+        why="Go 的 net/http/pprof.Profile 对 seconds **没有上界**"
+        "（ParseInt 之后直接拿去 sleep），所以 ?seconds=99999 会让一个 handler "
+        "线程占用 27 小时；而 profiling 期间运行时持续采样，进程比平时慢一截 —— "
+        "一条无上限的端点等于自我施加的 DoS。"
+        "改成静默钳制更隐蔽：请求方以为采了 10 分钟，实际是 1 分钟，"
+        "而报告里写的是「10 分钟 CPU 采样」—— 结论与请求不一致。",
+        note="变异体改写 r.URL.RawQuery 而不是只改局部变量 sec："
+        "下游 httppprof.Profile 读的是 r.FormValue(\"seconds\")，"
+        "只改局部变量的话下游拿到的仍是原始请求值 —— 那样这个变异体描述的后果不成立。"
+        "写变异体前先问「它描述的后果真的会发生吗」（M36 曾栽在这上面）。",
+    ),
 ]
 
 

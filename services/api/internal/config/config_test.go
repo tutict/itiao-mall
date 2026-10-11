@@ -197,3 +197,164 @@ func TestValidate_BodyLimits(t *testing.T) {
 		})
 	}
 }
+
+// TestValidate_PprofRejectedInProd 守"剖析端点可被外部访问"这件事。
+//
+// ★ 为什么这条与 validateMockProviders 是同一类问题
+//
+// mock provider 的危险在于"忘记配置"：漏设 PAYMENT_PROVIDER，服务照常启动、
+// 下单流程看上去完全正常、没有任何测试变红，只有主动打那个端点的人才发现。
+//
+// PPROF_ADDR 的形态一模一样，而且后果更直接：剖析端点可以读到进程内存。
+// heap/allocs 带出分配点的参数内容，goroutine?debug=2 带出每个协程的完整栈，
+// 而 cmdline（虽然本实现刻意不挂）会把 DATABASE_URL 的密码与 JWT_SECRET 一起吐出来。
+//
+// 特别要防的是 **":6060"** 这个写法 —— 它长得最像"本机端口"，
+// 但 Go 在 host 为空时绑的是通配地址，也就是所有网卡。
+// 那个默认分支必须落在拒绝的一侧。
+func TestValidate_PprofRejectedInProd(t *testing.T) {
+	cases := []struct {
+		name            string
+		appEnv          string
+		pprofAddr       string
+		maxSeconds      string
+		allowPublicProd string
+		wantErr         bool
+		wantMention     []string
+	}{
+		{
+			name:      "生产 + 空 host（绑通配，最危险的形态）：必须拒绝",
+			appEnv:    "prod",
+			pprofAddr: ":6060",
+			wantErr:   true,
+			// 错误信息必须点名逃生门，否则运维在部署窗口里无从下手。
+			wantMention: []string{"PPROF_ADDR", "ALLOW_PUBLIC_PPROF_IN_PROD"},
+		},
+		{
+			name:        "生产 + 显式 0.0.0.0：必须拒绝",
+			appEnv:      "prod",
+			pprofAddr:   "0.0.0.0:6060",
+			wantErr:     true,
+			wantMention: []string{"PPROF_ADDR"},
+		},
+		{
+			name:        "生产 + 局域网 IP：必须拒绝",
+			appEnv:      "prod",
+			pprofAddr:   "192.168.1.10:6060",
+			wantErr:     true,
+			wantMention: []string{"PPROF_ADDR"},
+		},
+		{
+			name:        "生产 + 公网 IP：必须拒绝",
+			appEnv:      "prod",
+			pprofAddr:   "203.0.113.5:6060",
+			wantErr:     true,
+			wantMention: []string{"PPROF_ADDR"},
+		},
+		{
+			name:            "生产 + 显式逃生门：放行（容器编排要这个）",
+			appEnv:          "prod",
+			pprofAddr:       "0.0.0.0:6060",
+			allowPublicProd: "true",
+		},
+		{
+			name:      "生产 + 回环：放行",
+			appEnv:    "prod",
+			pprofAddr: "127.0.0.1:6060",
+		},
+		{
+			name:      "生产 + IPv6 回环：放行",
+			appEnv:    "prod",
+			pprofAddr: "[::1]:6060",
+		},
+		{
+			name:      "dev + 通配：放行（开发便利优先，生产才是硬要求）",
+			appEnv:    "dev",
+			pprofAddr: ":6060",
+		},
+		{
+			name:   "生产 + 没配 PPROF_ADDR：放行（默认就是关）",
+			appEnv: "prod",
+			// 这是最重要的一条：**默认关闭**必须是安全的。
+			// 若哪天有人把默认值改成 ":6060"，这里会红。
+		},
+		{
+			name:        "开着 + maxSeconds 为 0：必须拒绝（会让每次采集都被拒）",
+			appEnv:      "dev",
+			pprofAddr:   "127.0.0.1:6060",
+			maxSeconds:  "0",
+			wantErr:     true,
+			wantMention: []string{"PPROF_MAX_SECONDS"},
+		},
+		{
+			name:        "开着 + maxSeconds 过大：必须拒绝（profiling 永久生效像负载问题）",
+			appEnv:      "dev",
+			pprofAddr:   "127.0.0.1:6060",
+			maxSeconds:  "86400",
+			wantErr:     true,
+			wantMention: []string{"PPROF_MAX_SECONDS"},
+		},
+		{
+			name:   "开着但 maxSeconds 超界，且 PPROF_ADDR 关闭：放行",
+			appEnv: "dev",
+			// 没开 pprof 就不该校验采集时长 ——
+			// 否则会出现"明明关了 pprof，却因为没配时长而启动失败"这种反直觉组合。
+			// 理由与 validateRateLimit 里对 RATE_LIMIT_* 的处理一致。
+			maxSeconds: "999999",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			baseEnv(t)
+			t.Setenv("APP_ENV", tc.appEnv)
+			t.Setenv("PPROF_ADDR", tc.pprofAddr)
+			t.Setenv("PPROF_MAX_SECONDS", tc.maxSeconds)
+			t.Setenv("ALLOW_PUBLIC_PPROF_IN_PROD", tc.allowPublicProd)
+
+			// ★ 生产场景统一开 mock 逃生门，这条与被测的 pprof 校验无关。
+			//
+			// 不开的话，每个"生产 + 期望通过"的用例都会先被既有的
+			// validateMockProviders 拦下（baseEnv 里 AUTH/PAYMENT 都是 mock），
+			// 于是这条用例实际测的是"mock 校验还在生效"，
+			// 而它自己声称要测的东西（回环地址放行）**一次都没跑到**。
+			// 那种"名字说测 A、实际测 B"的用例比没有更坏：
+			// 它在回环判定写错时仍然全绿。
+			t.Setenv("ALLOW_MOCK_PROVIDERS_IN_PROD", "true")
+
+			_, err := Load()
+			if !tc.wantErr {
+				if err != nil {
+					t.Fatalf("期望通过，实际报错: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("期望报错，实际通过")
+			}
+			for _, m := range tc.wantMention {
+				if !strings.Contains(err.Error(), m) {
+					t.Errorf("错误信息应提到 %s，实际: %v", m, err)
+				}
+			}
+		})
+	}
+}
+
+// TestPprofEnabled_DefaultIsOff 单独钉住"默认关闭"这条。
+//
+// 它与上面的表里"没配就放行"不是同一件事：那条验的是**不报错**，
+// 这条验的是**真的不起端口**。一个"配了才校验、但没配时照样起端口"的实现
+// 能通过上面那张表，却在这里现形。
+func TestPprofEnabled_DefaultIsOff(t *testing.T) {
+	baseEnv(t)
+	t.Setenv("PPROF_ADDR", "")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load 失败: %v", err)
+	}
+	if cfg.PprofEnabled() {
+		t.Fatal("未配置 PPROF_ADDR 时 PprofEnabled() 为 true —— " +
+			"剖析端点必须默认不存在（它可以读到进程内存）")
+	}
+}

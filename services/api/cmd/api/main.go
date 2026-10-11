@@ -20,6 +20,7 @@ import (
 	"github.com/tutic/itiao-mall/services/api/internal/platform/logging"
 	"github.com/tutic/itiao-mall/services/api/internal/platform/migrate"
 	"github.com/tutic/itiao-mall/services/api/internal/platform/postgres"
+	"github.com/tutic/itiao-mall/services/api/internal/platform/profiling"
 	"github.com/tutic/itiao-mall/services/api/internal/ratelimit"
 )
 
@@ -230,6 +231,30 @@ func runServe(cfg *config.Config, logger *slog.Logger) error {
 		}
 	}()
 
+	// 剖析端口。刻意是**独立的 http.Server**，理由见 profiling 包的文档注释。
+	//
+	// 启动日志走 Warn 而不是 Info：它的作用是让"这个进程此刻可以被读到内存"
+	// 这件事在日志里显眼。事故复盘时，事后才知道半小时前能抓 profile 毫无用处。
+	var pprofSrv *http.Server
+	if cfg.PprofEnabled() {
+		pprofSrv = profiling.NewServer(cfg.PprofAddr, cfg.PprofMaxSeconds)
+		go func() {
+			logger.Warn("⚠ 性能剖析端点已启用",
+				slog.String("addr", pprofSrv.Addr),
+				slog.Int("max_seconds", cfg.PprofMaxSeconds),
+				slog.Any("profiles", profiling.ProfileNames()),
+				slog.Any("needs_sampling_rate_enabled", profiling.BlockedProfiles()),
+			)
+			if err := pprofSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				// 剖析端口起不来**不影响**主服务：它只影响排障能力。
+				// 但必须打出来 —— 否则现象是"我配了 PPROF_ADDR 却抓不到 profile"，
+				// 而配置、启动日志、实际监听三处都显示一切正常。
+				logger.Error("性能剖析端点启动失败（主服务不受影响，但排障时将无法抓 profile）",
+					slog.Any("err", err))
+			}
+		}()
+	}
+
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 
@@ -244,6 +269,14 @@ func runServe(cfg *config.Config, logger *slog.Logger) error {
 	defer shutdownCancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		return fmt.Errorf("优雅关闭失败: %w", err)
+	}
+	// 剖析端口也要关。不关的话进程退出前会挂着一个空等的 listener，
+	// 而此时主服务已经不再接受请求 —— 现象是"关闭时抓 profile 超时"，
+	// 会被误读成 profile 端点有问题。
+	if pprofSrv != nil {
+		if err := pprofSrv.Shutdown(shutdownCtx); err != nil {
+			logger.Warn("剖析端点关闭失败", slog.Any("err", err))
+		}
 	}
 	logger.Info("服务已停止")
 	return nil

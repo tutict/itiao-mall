@@ -7,7 +7,24 @@ import (
 	"time"
 
 	"github.com/caarlos0/env/v11"
+
+	"github.com/tutic/itiao-mall/services/api/internal/platform/profiling"
 )
+
+// pprofMaxSecondsCap 是 PPROF_MAX_SECONDS 的合法上界。
+//
+// ★ 刻意**引用** profiling.MaxSecondsHardCap 而不是再写一遍字面量。
+//
+// 两处设防（config 拒绝非法配置、profiling 再做一次钳制）是必要的：
+// 包可以被不经 config.Load 直接调用，那时钳制是唯一剩下的防线，
+// 只在一处设防等于给另一处留了绕过路径。
+//
+// 但"两处都要有"说的是**两道防线**，不是**两个数字**。
+// 各写一个字面量 600 等于把"它们必须相等"寄存在注释里：
+// 改一处不改另一处不会让任何测试变红，只会让校验与钳制悄悄错开
+// （校验放行了 900，钳制却把它压到 600，而请求方以为自己采了 900 秒）。
+// 单源之后，这个漂移在编译期就不成立。
+const pprofMaxSecondsCap = profiling.MaxSecondsHardCap
 
 // Config 是服务的全部运行期配置，全部来自环境变量。
 // 缺必填项或取值非法时在启动阶段直接失败（fail-fast），不做静默兜底。
@@ -100,6 +117,31 @@ type Config struct {
 	// 若将来支持图片内联上传，这个值要按 base64 膨胀率（×1.37）重算。
 	MaxBodyBytes   int64 `env:"MAX_BODY_BYTES" envDefault:"1048576"`
 	MaxHeaderBytes int   `env:"MAX_HEADER_BYTES" envDefault:"16384"`
+
+	// ============================ 性能剖析 ============================
+	//
+	// PprofAddr 为空（默认）表示**不启动**剖析端点。
+	//
+	// 为什么不默认开：pprof 不是普通的只读端点。heap/allocs 会吐出
+	// 分配点的参数内容，goroutine?debug=2 会吐出每个协程的完整栈，
+	// cmdline 会吐出整个命令行（含 DATABASE_URL 的密码与 JWT_SECRET）。
+	// 一个可访问的 pprof ≈ 一份进程内存快照。所以它默认不存在，
+	// 要用必须显式配 —— 而不是"默认开、想安全就记得关"。
+	//
+	// PprofMaxSeconds 是单次采集的秒数上限。
+	// Go 的 net/http/pprof 对 seconds 参数**没有上界**（ParseInt 之后直接 sleep），
+	// 所以这一层是必要的钳制；上限存在是因为 profiling 期间进程会持续变慢，
+	// 一条无上限的采集端点等于自我施加的 DoS。
+	PprofAddr       string `env:"PPROF_ADDR" envDefault:""`
+	PprofMaxSeconds int    `env:"PPROF_MAX_SECONDS" envDefault:"60"`
+
+	// AllowPublicPprofInProd 是显式逃生门：允许生产环境的 pprof 绑到
+	// **非回环**地址（典型场景是容器编排里让 sidecar/ephemeral container
+	// 从别的 Pod 抓 profile，此时只能绑 0.0.0.0）。
+	//
+	// 命名沿用 ALLOW_MOCK_PROVIDERS_IN_PROD 的刻意笨重：
+	// grep 到它的人应该立刻明白自己正在降低安全等级。
+	AllowPublicPprofInProd bool `env:"ALLOW_PUBLIC_PPROF_IN_PROD" envDefault:"false"`
 }
 
 // Load 读取并校验配置。
@@ -139,6 +181,9 @@ func (c *Config) validate() error {
 	}
 
 	if err := c.validateMockProviders(); err != nil {
+		return err
+	}
+	if err := c.validatePprof(); err != nil {
 		return err
 	}
 
@@ -223,6 +268,57 @@ func (c *Config) validateMockProviders() error {
 			"  改法：配置真实 provider（AUTH_PROVIDER=wechat / PAYMENT_PROVIDER=wechat）；\n"+
 			"  如果这只是一台演示/验收环境，请显式设置 ALLOW_MOCK_PROVIDERS_IN_PROD=true。",
 		c.AppEnv, strings.Join(offending, "\n  - "))
+}
+
+// PprofEnabled 回答"要不要起剖析端口"。
+func (c *Config) PprofEnabled() bool { return strings.TrimSpace(c.PprofAddr) != "" }
+
+// validatePprof 拦住"剖析端点可被外部访问"这件事。
+//
+// ★ 为什么这条校验是"绑回环"而不是"生产干脆不许开"
+//
+// 完全禁止生产开 pprof 会在两种真实场景下逼人绕过：
+// 容器编排里 sidecar/ephemeral container 要从别的 Pod 抓 profile，
+// 而那里只能绑 0.0.0.0；跳板机/内网调试机则确实需要非回环访问。
+//
+// 但"忘记配"这件事本身必须被拦住。默认空 = 不开，且生产环境一旦要开，
+// 就得**显式声明**绑回环 —— 而漏配 host 段（写成 ":6060"）是 Go 里的常见写法，
+// 它绑的是通配地址，也就是所有网卡：形状最像"本机端口"，实际全网可达。
+// 那个默认分支必须落在拒绝的一侧。
+func (c *Config) validatePprof() error {
+	if !c.PprofEnabled() {
+		// 没开就不校验其余两项。理由与 validateRateLimit 相同：
+		// 会出现"明明关了 pprof，却因为采集时长没配对而启动失败"这种反直觉组合。
+		return nil
+	}
+	if c.PprofMaxSeconds < 1 {
+		return fmt.Errorf("PPROF_MAX_SECONDS 必须 ≥ 1（0 会让每一次采集都被拒）")
+	}
+	if c.PprofMaxSeconds > pprofMaxSecondsCap {
+		// 上界不是性能保护，是**配置事故的护栏**。采样时长配成 86400
+		//（"录一整天"）会让 profiling 几乎永久生效，而它的表现
+		//（服务变慢）不像错误、像负载问题 —— 排障方向会从一开始就错。
+		// 真要长时间采样就分多次抓，不要拉长单个窗口。
+		return fmt.Errorf("PPROF_MAX_SECONDS 不能超过 %d 秒（当前 %d）",
+			pprofMaxSecondsCap, c.PprofMaxSeconds)
+	}
+
+	if !c.IsProd() || c.AllowPublicPprofInProd {
+		return nil
+	}
+	if profiling.IsLoopbackAddr(c.PprofAddr) {
+		return nil
+	}
+
+	return fmt.Errorf(
+		"生产环境（APP_ENV=%q）的 PPROF_ADDR 必须绑回环地址，当前是 %q。\n"+
+			"  剖析端点可以读到进程内存：heap/allocs 会带出分配点的参数内容，\n"+
+			"  goroutine?debug=2 会带出每个协程的完整栈，cmdline 会带出\n"+
+			"  DATABASE_URL（含密码）与 JWT_SECRET。一个可访问的 pprof ≈ 一份内存快照。\n"+
+			"  改法一：绑回环，如 PPROF_ADDR=127.0.0.1:6060；\n"+
+			"  改法二：如果确实要让容器里的调试容器从外面抓，\n"+
+			"        请显式设置 ALLOW_PUBLIC_PPROF_IN_PROD=true，并确认该端口不对外网暴露。",
+		c.AppEnv, c.PprofAddr)
 }
 
 // MockProvidersAllowed 回答"当前是否在跑 mock 认证/支付"。
